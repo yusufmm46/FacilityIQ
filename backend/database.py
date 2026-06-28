@@ -30,12 +30,29 @@ def _build_async_url(raw: str) -> str:
 
 ASYNC_DB_URL = _build_async_url(_raw_url)
 
+# When running behind Supabase's transaction pooler (Supavisor, port 6543),
+# server-side prepared statements are not supported. Disable asyncpg's
+# statement cache and give prepared statements unique names so the pooler
+# doesn't choke. Safe to leave on for direct/session connections too.
+_is_pooler = "pooler.supabase.com" in ASYNC_DB_URL
+
+_connect_args = {}
+if _is_pooler:
+    import uuid as _uuid
+    _connect_args = {
+        # Disable asyncpg's prepared-statement cache (unsupported in tx pooler)
+        "statement_cache_size": 0,
+        # Unique prepared-statement names so pooled backends never collide
+        "prepared_statement_name_func": lambda: f"__asyncpg_{_uuid.uuid4()}__",
+    }
+
 engine = create_async_engine(
     ASYNC_DB_URL,
     echo=False,
     pool_size=5,
     max_overflow=10,
     pool_pre_ping=True,
+    connect_args=_connect_args,
 )
 
 AsyncSessionLocal = async_sessionmaker(
