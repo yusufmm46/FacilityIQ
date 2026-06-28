@@ -1,0 +1,1183 @@
+import io
+import os
+import sys
+import json
+import hashlib
+import tempfile
+import uuid
+from datetime import datetime
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from scipy.optimize import minimize
+from sqlalchemy import select, delete, text
+from sqlalchemy.ext.asyncio import AsyncSession
+
+# Add backend to path so imports work
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from database import get_db, init_db
+from models import (
+    Organisation, Building, Floor, Area, AccessPoint,
+    Zone, RssiUpload, DevicePosition
+)
+
+app = FastAPI(title="FacilityIQ API", version="2.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+TX_POWER = -30
+PATH_LOSS_N = 2.5
+
+
+# ── STARTUP ──────────────────────────────────────────────────────
+@app.on_event("startup")
+async def startup():
+    await init_db()
+
+
+# ── HELPERS ──────────────────────────────────────────────────────
+def rssi_to_distance(rssi):
+    return 10 ** ((TX_POWER - rssi) / (10 * PATH_LOSS_N))
+
+
+def trilaterate(ap_positions, distances, floor_w=100, floor_h=60):
+    def error(pos):
+        total = 0
+        for (ax, ay), d_est in zip(ap_positions, distances):
+            d_calc = np.sqrt((pos[0] - ax) ** 2 + (pos[1] - ay) ** 2)
+            total += (d_calc - d_est) ** 2
+        return total
+
+    weights = [1 / max(d, 0.1) for d in distances]
+    x0 = np.average([p[0] for p in ap_positions], weights=weights)
+    y0 = np.average([p[1] for p in ap_positions], weights=weights)
+    result = minimize(error, [x0, y0], method="Nelder-Mead")
+    x = float(np.clip(result.x[0], 0, floor_w))
+    y = float(np.clip(result.x[1], 0, floor_h))
+    return round(x, 2), round(y, 2)
+
+
+def point_in_polygon(x, y, polygon):
+    """Ray-casting algorithm. polygon is list of [px, py] in meters."""
+    n = len(polygon)
+    inside = False
+    j = n - 1
+    for i in range(n):
+        xi, yi = polygon[i][0], polygon[i][1]
+        xj, yj = polygon[j][0], polygon[j][1]
+        if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / (yj - yi) + xi):
+            inside = not inside
+        j = i
+    return inside
+
+
+def get_zone_status(pct):
+    if pct < 30:
+        return "QUIET"
+    elif pct < 60:
+        return "MODERATE"
+    elif pct < 80:
+        return "BUSY"
+    return "CRITICAL"
+
+
+def meters_to_svg(x_m, y_m, width_m, height_m, vw=1000, vh=600):
+    scale = min(vw / max(width_m, 0.01), vh / max(height_m, 0.01))
+    x_svg = x_m * scale + (vw - width_m * scale) / 2
+    y_svg = (height_m - y_m) * scale + (vh - height_m * scale) / 2
+    return round(x_svg, 1), round(y_svg, 1)
+
+
+# ── PYDANTIC SCHEMAS ──────────────────────────────────────────────
+class OrgCreate(BaseModel):
+    name: str
+
+
+class BuildingCreate(BaseModel):
+    org_id: str
+    name: str
+    address: Optional[str] = None
+    city: Optional[str] = None
+    country: Optional[str] = None
+
+
+class BuildingUpdate(BaseModel):
+    name: Optional[str] = None
+    address: Optional[str] = None
+    city: Optional[str] = None
+    country: Optional[str] = None
+
+
+class FloorCreate(BaseModel):
+    building_id: str
+    name: str
+    level_number: int = 1
+
+
+class FloorUpdate(BaseModel):
+    name: Optional[str] = None
+    level_number: Optional[int] = None
+
+
+class AreaCreate(BaseModel):
+    floor_id: str
+    name: str
+
+
+class AreaUpdate(BaseModel):
+    name: Optional[str] = None
+    width_m: Optional[float] = None
+    height_m: Optional[float] = None
+
+
+class ZoneCreate(BaseModel):
+    area_id: str
+    name: str
+    capacity: int = 10
+    polygon_json: list
+    color: str = "#3B82F6"
+    method: str = "freehand"
+
+
+class ZoneUpdate(BaseModel):
+    name: Optional[str] = None
+    capacity: Optional[int] = None
+    color: Optional[str] = None
+
+
+# ── HEALTH ────────────────────────────────────────────────────────
+@app.get("/api/health")
+async def health(db: AsyncSession = Depends(get_db)):
+    try:
+        await db.execute(text("SELECT 1"))
+        db_status = "connected"
+    except Exception as e:
+        db_status = f"error: {e}"
+    return {"status": "ok", "database": db_status}
+
+
+@app.get("/")
+def root():
+    return {"message": "FacilityIQ API v2 ✅"}
+
+
+# ── ORGANISATIONS ─────────────────────────────────────────────────
+@app.post("/api/organisations")
+async def create_org(body: OrgCreate, db: AsyncSession = Depends(get_db)):
+    org = Organisation(id=str(uuid.uuid4()), name=body.name)
+    db.add(org)
+    await db.commit()
+    await db.refresh(org)
+    return {"id": org.id, "name": org.name, "created_at": str(org.created_at)}
+
+
+@app.get("/api/organisations")
+async def list_orgs(db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(Organisation).order_by(Organisation.created_at))
+    orgs = result.scalars().all()
+    return [{"id": o.id, "name": o.name, "created_at": str(o.created_at)} for o in orgs]
+
+
+# ── BUILDINGS ─────────────────────────────────────────────────────
+@app.post("/api/buildings")
+async def create_building(body: BuildingCreate, db: AsyncSession = Depends(get_db)):
+    b = Building(
+        id=str(uuid.uuid4()),
+        org_id=body.org_id,
+        name=body.name,
+        address=body.address,
+        city=body.city,
+        country=body.country,
+    )
+    db.add(b)
+    await db.commit()
+    await db.refresh(b)
+    return _building_dict(b)
+
+
+@app.get("/api/buildings")
+async def list_buildings(org_id: Optional[str] = None, db: AsyncSession = Depends(get_db)):
+    q = select(Building).order_by(Building.created_at)
+    if org_id:
+        q = q.where(Building.org_id == org_id)
+    result = await db.execute(q)
+    return [_building_dict(b) for b in result.scalars().all()]
+
+
+@app.put("/api/buildings/{bid}")
+async def update_building(bid: str, body: BuildingUpdate, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(Building).where(Building.id == bid))
+    b = result.scalar_one_or_none()
+    if not b:
+        raise HTTPException(404, "Building not found")
+    if body.name is not None:
+        b.name = body.name
+    if body.address is not None:
+        b.address = body.address
+    if body.city is not None:
+        b.city = body.city
+    if body.country is not None:
+        b.country = body.country
+    await db.commit()
+    await db.refresh(b)
+    return _building_dict(b)
+
+
+@app.delete("/api/buildings/{bid}")
+async def delete_building(bid: str, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(Building).where(Building.id == bid))
+    b = result.scalar_one_or_none()
+    if not b:
+        raise HTTPException(404, "Building not found")
+    await db.delete(b)
+    await db.commit()
+    return {"deleted": bid}
+
+
+def _building_dict(b):
+    return {
+        "id": b.id, "org_id": b.org_id, "name": b.name,
+        "address": b.address, "city": b.city, "country": b.country,
+        "created_at": str(b.created_at),
+    }
+
+
+# ── FLOORS ────────────────────────────────────────────────────────
+@app.post("/api/floors")
+async def create_floor(body: FloorCreate, db: AsyncSession = Depends(get_db)):
+    f = Floor(id=str(uuid.uuid4()), building_id=body.building_id, name=body.name, level_number=body.level_number)
+    db.add(f)
+    await db.commit()
+    await db.refresh(f)
+    return _floor_dict(f)
+
+
+@app.get("/api/floors")
+async def list_floors(building_id: Optional[str] = None, db: AsyncSession = Depends(get_db)):
+    q = select(Floor).order_by(Floor.level_number)
+    if building_id:
+        q = q.where(Floor.building_id == building_id)
+    result = await db.execute(q)
+    return [_floor_dict(f) for f in result.scalars().all()]
+
+
+@app.put("/api/floors/{fid}")
+async def update_floor(fid: str, body: FloorUpdate, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(Floor).where(Floor.id == fid))
+    f = result.scalar_one_or_none()
+    if not f:
+        raise HTTPException(404, "Floor not found")
+    if body.name is not None:
+        f.name = body.name
+    if body.level_number is not None:
+        f.level_number = body.level_number
+    await db.commit()
+    await db.refresh(f)
+    return _floor_dict(f)
+
+
+@app.delete("/api/floors/{fid}")
+async def delete_floor(fid: str, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(Floor).where(Floor.id == fid))
+    f = result.scalar_one_or_none()
+    if not f:
+        raise HTTPException(404, "Floor not found")
+    await db.delete(f)
+    await db.commit()
+    return {"deleted": fid}
+
+
+def _floor_dict(f):
+    return {"id": f.id, "building_id": f.building_id, "name": f.name,
+            "level_number": f.level_number, "created_at": str(f.created_at)}
+
+
+# ── AREAS ─────────────────────────────────────────────────────────
+@app.post("/api/areas")
+async def create_area(body: AreaCreate, db: AsyncSession = Depends(get_db)):
+    a = Area(id=str(uuid.uuid4()), floor_id=body.floor_id, name=body.name)
+    db.add(a)
+    await db.commit()
+    await db.refresh(a)
+    return _area_dict(a)
+
+
+@app.get("/api/areas")
+async def list_areas(floor_id: Optional[str] = None, db: AsyncSession = Depends(get_db)):
+    q = select(Area).order_by(Area.created_at)
+    if floor_id:
+        q = q.where(Area.floor_id == floor_id)
+    result = await db.execute(q)
+    areas = result.scalars().all()
+    out = []
+    for a in areas:
+        zones_r = await db.execute(select(Zone).where(Zone.area_id == a.id))
+        aps_r = await db.execute(select(AccessPoint).where(AccessPoint.area_id == a.id))
+        d = _area_dict(a)
+        d["zones"] = [_zone_dict(z) for z in zones_r.scalars().all()]
+        d["access_points"] = [_ap_dict(p) for p in aps_r.scalars().all()]
+        out.append(d)
+    return out
+
+
+@app.put("/api/areas/{aid}")
+async def update_area(aid: str, body: AreaUpdate, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(Area).where(Area.id == aid))
+    a = result.scalar_one_or_none()
+    if not a:
+        raise HTTPException(404, "Area not found")
+    if body.name is not None:
+        a.name = body.name
+    if body.width_m is not None:
+        a.width_m = body.width_m
+    if body.height_m is not None:
+        a.height_m = body.height_m
+    await db.commit()
+    await db.refresh(a)
+    return _area_dict(a)
+
+
+@app.delete("/api/areas/{aid}")
+async def delete_area(aid: str, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(Area).where(Area.id == aid))
+    a = result.scalar_one_or_none()
+    if not a:
+        raise HTTPException(404, "Area not found")
+    await db.delete(a)
+    await db.commit()
+    return {"deleted": aid}
+
+
+def _area_dict(a):
+    return {
+        "id": a.id, "floor_id": a.floor_id, "name": a.name,
+        "width_m": a.width_m, "height_m": a.height_m,
+        "svg_path_data": a.svg_path_data,
+        "dxf_parsed_data": a.dxf_parsed_data,
+        "created_at": str(a.created_at),
+    }
+
+
+# ── DXF PARSING ───────────────────────────────────────────────────
+
+# Layers that represent structural room walls (kept as room polys)
+_STRUCTURAL_LAYERS = {
+    "WALLS", "WALL", "ROOMS", "ROOM", "PARTITIONS", "PARTITION",
+    "INTERIOR", "INTERIORS", "SPACE", "SPACES", "STRUCTURAL",
+    "ARCHITECTURE", "ARCH", "A-WALL", "A-WALLS", "A-ROOM", "A-ROOMS",
+    "A-AREA", "A-FLOR", "A-FLOR-OTLN", "BOUNDARY", "BOUNDARIES",
+    "FLOOR_BOUNDARY", "OUTLINE", "OUTLINES", "PERIMETER",
+}
+
+# Layers to always exclude (furniture, annotations, dimensions, etc.)
+_EXCLUDE_LAYERS = {
+    "FURNITURE", "FURN", "FURNITUR", "FF&E", "FIXTURES",
+    "DIMENSIONS", "DIMENSION", "DIM", "DIMS", "ANNO",
+    "ANNOTATION", "ANNOTATIONS", "TEXT", "TEXTS",
+    "DOORS", "DOOR", "WINDOWS", "WINDOW", "WIN",
+    "COLUMNS", "COLUMN", "COL", "STAIR", "STAIRS",
+    "HATCH", "HATCHING", "PATTERN", "DEFPOINTS",
+    "TITLEBLOCK", "TITLE", "BORDER", "FRAME",
+    "ELECTRICAL", "ELEC", "PLUMBING", "PLUMB", "HVAC",
+    "DETAIL", "DETAILS", "NOTES", "NOTE",
+}
+
+# AP layer names to search
+_AP_LAYERS = {
+    "AP", "APS", "ACCESS-POINTS", "ACCESS_POINTS", "ACCESSPOINTS",
+    "WIFI", "WIRELESS", "NETWORK", "WLAN", "ROUTER", "ROUTERS",
+    "AP-LOCATIONS", "AP_LOCATIONS", "WIFIAP", "WIFI-AP",
+}
+
+# Attribute tag names that hold the AP ID
+_AP_ATTRIB_TAGS = {
+    "APID", "AP_ID", "AP-ID", "ID", "NAME", "SSID",
+    "LABEL", "TAG", "DEVICE", "DEVICE_ID",
+}
+
+
+def _ap_coverage_analysis(ap_list, floor_pts, width_m, height_m):
+    """
+    Compare AP positions against the floor boundary.
+    Returns coverage stats: floor_area_m2, coverage_radius_m per AP,
+    estimated_coverage_pct, APs outside boundary, dead zones (corners far from any AP).
+    """
+    import math
+
+    floor_area = abs(_shoelace_area([(p[0], p[1]) for p in floor_pts]))
+
+    # Typical Wi-Fi indoor range ~10-15m radius, use 10m conservative
+    AP_RADIUS_M = 10.0
+    ap_circle_area = math.pi * AP_RADIUS_M ** 2
+
+    # Check each AP: inside floor boundary?
+    aps_inside = []
+    aps_outside = []
+    for ap in ap_list:
+        x, y = ap["x_m"], ap["y_m"]
+        poly = [(p[0], p[1]) for p in floor_pts]
+        if point_in_polygon(x, y, poly):
+            aps_inside.append(ap["ap_id"])
+        else:
+            aps_outside.append(ap["ap_id"])
+
+    # Rough coverage estimate: union of circles vs floor area
+    # Simple approximation: n APs × circle area, capped at floor area
+    raw_coverage = len(ap_list) * ap_circle_area
+    coverage_pct = min(100.0, round((raw_coverage / max(floor_area, 1)) * 100, 1))
+
+    # Recommended AP count based on floor area (1 AP per 80m² indoors)
+    recommended_aps = max(1, math.ceil(floor_area / 80))
+
+    # Dead zone warning: if recommended > actual
+    dead_zone_risk = recommended_aps > len(ap_list)
+
+    return {
+        "floor_area_m2": round(floor_area, 1),
+        "ap_count": len(ap_list),
+        "ap_radius_m": AP_RADIUS_M,
+        "estimated_coverage_pct": coverage_pct,
+        "aps_inside_boundary": aps_inside,
+        "aps_outside_boundary": aps_outside,
+        "recommended_ap_count": recommended_aps,
+        "dead_zone_risk": dead_zone_risk,
+        "coverage_rating": (
+            "Excellent" if coverage_pct >= 90 else
+            "Good"      if coverage_pct >= 70 else
+            "Fair"      if coverage_pct >= 50 else
+            "Poor"
+        ),
+    }
+
+
+@app.post("/api/dxf/parse")
+async def parse_dxf(
+    file: UploadFile = File(...),
+    area_id: str = Form(...),
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        import ezdxf
+    except ImportError:
+        raise HTTPException(500, "ezdxf not installed. Run: pip install ezdxf")
+
+    result = await db.execute(select(Area).where(Area.id == area_id))
+    area = result.scalar_one_or_none()
+    if not area:
+        raise HTTPException(404, "Area not found")
+
+    contents = await file.read()
+    with tempfile.NamedTemporaryFile(suffix=".dxf", delete=False) as tmp:
+        tmp.write(contents)
+        tmp_path = tmp.name
+
+    try:
+        doc = ezdxf.readfile(tmp_path)
+    except Exception as e:
+        os.unlink(tmp_path)
+        raise HTTPException(400, f"DXF parse error: {e}")
+
+    msp = doc.modelspace()
+    warnings = []
+
+    # ── 1. UNIT DETECTION ──────────────────────────────────────────
+    unit_code = doc.header.get("$INSUNITS", 0)
+    unit_factors = {
+        0: 1.0,      # unknown → assume meters
+        1: 0.0254,   # inches
+        2: 0.3048,   # feet
+        4: 0.001,    # millimeters (most common in architectural DXF)
+        5: 0.01,     # centimeters
+        6: 1.0,      # meters
+        13: 0.01,    # centimeters (alternate code)
+    }
+    unit_factor = unit_factors.get(unit_code, 1.0)
+    unit_name = {0:"unknown(m)",1:"inches",2:"feet",4:"mm",5:"cm",6:"m",13:"cm"}.get(unit_code,"unknown")
+
+    if unit_code == 0:
+        warnings.append("$INSUNITS not set in DXF header — assuming meters. If the floor plan looks wrong, the file may use different units.")
+
+    # ── 2. COLLECT ALL LWPOLYLINES ─────────────────────────────────
+    polylines_raw = []
+    layers_found = set()
+
+    for e in msp:
+        layers_found.add(e.dxf.layer)
+        if e.dxftype() != "LWPOLYLINE":
+            continue
+        try:
+            pts = [(v[0] * unit_factor, v[1] * unit_factor) for v in e.get_points("xy")]
+            if len(pts) < 2:
+                continue
+            # Use both flag bit and e.closed property for maximum compatibility
+            is_closed = e.closed or bool(e.dxf.flags & 1)
+            area_sqm = abs(_shoelace_area(pts))
+            polylines_raw.append({
+                "pts": pts,
+                "is_closed": is_closed,
+                "layer": e.dxf.layer,
+                "area_sqm": area_sqm,
+            })
+        except Exception:
+            continue
+
+    if not polylines_raw:
+        os.unlink(tmp_path)
+        raise HTTPException(400, "No LWPOLYLINE entities found in DXF. The file may use POLYLINE or SPLINE entities which are not yet supported.")
+
+    # ── 3. FLOOR BOUNDARY DETECTION ───────────────────────────────
+    # Strategy: prefer a poly on a known boundary layer; fall back to largest closed
+    boundary_layer_polys = [
+        p for p in polylines_raw
+        if p["layer"].upper() in {"FLOOR_BOUNDARY", "BOUNDARY", "OUTLINE", "PERIMETER", "A-FLOR-OTLN"}
+        and p["is_closed"]
+    ]
+    closed_polys = [p for p in polylines_raw if p["is_closed"]]
+
+    if boundary_layer_polys:
+        floor_poly = max(boundary_layer_polys, key=lambda p: p["area_sqm"])
+    elif closed_polys:
+        floor_poly = max(closed_polys, key=lambda p: p["area_sqm"])
+        warnings.append(f"No FLOOR_BOUNDARY layer found — using largest closed polyline on layer '{floor_poly['layer']}' as floor boundary.")
+    else:
+        # Last resort: use largest polyline even if open
+        floor_poly = max(polylines_raw, key=lambda p: p["area_sqm"])
+        warnings.append("No closed polylines found — using largest polyline as floor boundary. Results may be inaccurate.")
+
+    # ── 4. NORMALIZE COORDINATES ──────────────────────────────────
+    all_x = [v[0] for v in floor_poly["pts"]]
+    all_y = [v[1] for v in floor_poly["pts"]]
+    origin_x, origin_y = min(all_x), min(all_y)
+    width_m  = max(all_x) - origin_x
+    height_m = max(all_y) - origin_y
+
+    if width_m < 0.1 or height_m < 0.1:
+        os.unlink(tmp_path)
+        raise HTTPException(400, f"Floor boundary too small ({width_m:.3f}m × {height_m:.3f}m). Check that $INSUNITS is set correctly in the DXF file (current: {unit_name}).")
+
+    def normalize(pts):
+        return [[round(v[0] - origin_x, 4), round(v[1] - origin_y, 4)] for v in pts]
+
+    floor_pts = normalize(floor_poly["pts"])
+
+    # ── 5. SVG COORDINATE SYSTEM ──────────────────────────────────
+    vw, vh = 1000, 600
+    scale    = min(vw / max(width_m, 0.01), vh / max(height_m, 0.01))
+    offset_x = (vw - width_m * scale) / 2
+    offset_y = (vh - height_m * scale) / 2
+
+    def to_svg(x_m, y_m):
+        return round(x_m * scale + offset_x, 1), round((height_m - y_m) * scale + offset_y, 1)
+
+    def pts_to_svg_path(pts):
+        parts = [f"{'M' if i == 0 else 'L'} {to_svg(x,y)[0]},{to_svg(x,y)[1]}" for i,(x,y) in enumerate(pts)]
+        parts.append("Z")
+        return " ".join(parts)
+
+    floor_svg_path = pts_to_svg_path(floor_pts)
+
+    # ── 6. POLYLINES — two lists ──────────────────────────────────
+    # display_polylines : ALL polys (walls + furniture) for visual rendering
+    # structural_polylines: walls/rooms only, for zone drawing in AreaSetupView
+    floor_area_m2 = abs(_shoelace_area([(p[0], p[1]) for p in floor_pts]))
+    min_room_area = max(1.0, floor_area_m2 * 0.005)
+
+    display_polylines    = []   # everything — shown in FloorPlanView
+    structural_polylines = []   # walls only — used for CAD zone selection
+
+    for i, p in enumerate(polylines_raw):
+        if p is floor_poly:
+            continue
+        norm_pts = normalize(p["pts"])
+        layer_up = p["layer"].upper()
+
+        # Classify layer
+        is_structural = layer_up in _STRUCTURAL_LAYERS
+        is_furniture  = layer_up in _EXCLUDE_LAYERS
+        is_room_scale = p["area_sqm"] >= min_room_area
+
+        poly_obj = {
+            "id": f"poly_{i:03d}",
+            "svg_path": pts_to_svg_path(norm_pts),
+            "points_m": norm_pts,
+            "is_closed": p["is_closed"],
+            "layer": p["layer"],
+            "area_sqm": round(p["area_sqm"], 2),
+            # category drives frontend stroke style
+            "category": (
+                "structural" if is_structural else
+                "furniture"  if is_furniture  else
+                "detail"
+            ),
+        }
+
+        # Display: include everything except annotation/dimension open lines
+        # Skip open non-structural lines that are clearly just dimension text lines
+        if p["is_closed"] or is_structural:
+            display_polylines.append(poly_obj)
+        elif not (layer_up in {"DIMENSIONS", "DIMENSION", "DIM", "DIMS", "TEXT", "TEXTS", "ANNO", "ANNOTATIONS", "TITLEBLOCK", "TITLE", "BORDER", "DEFPOINTS"}):
+            display_polylines.append(poly_obj)
+
+        # Structural: closed and room-scale only
+        if p["is_closed"] and (is_structural or is_room_scale) and not is_furniture:
+            structural_polylines.append(poly_obj)
+
+    # Keep room_polys as alias for backwards compat
+    room_polys = structural_polylines
+
+    # ── 7. ACCESS POINT EXTRACTION ────────────────────────────────
+    ap_entities = []
+
+    for e in msp:
+        if e.dxftype() != "INSERT":
+            continue
+        layer_up = e.dxf.layer.upper()
+        if layer_up not in _AP_LAYERS:
+            continue
+        try:
+            x = round(e.dxf.insert.x * unit_factor - origin_x, 3)
+            y = round(e.dxf.insert.y * unit_factor - origin_y, 3)
+        except Exception:
+            continue
+
+        # Try to get AP ID from attributes
+        ap_id = None
+        try:
+            for attrib in e.attribs:
+                if attrib.dxf.tag.upper() in _AP_ATTRIB_TAGS:
+                    ap_id = attrib.dxf.text.strip()
+                    break
+        except Exception:
+            pass
+        if not ap_id:
+            # Fallback: block name + index
+            try:
+                ap_id = f"{e.dxf.name}-{len(ap_entities)+1:02d}"
+            except Exception:
+                ap_id = f"AP-{len(ap_entities)+1:02d}"
+
+        sx, sy = to_svg(x, y)
+        ap_entities.append({
+            "ap_id": ap_id, "x_m": x, "y_m": y,
+            "x_svg": sx, "y_svg": sy, "layer": e.dxf.layer,
+        })
+
+    if not ap_entities:
+        # Warn with all INSERT layers actually found, to help user fix layer name
+        insert_layers = sorted({e.dxf.layer for e in msp if e.dxftype() == "INSERT"})
+        warnings.append(
+            f"No APs found. Expected INSERT entities on one of: {sorted(_AP_LAYERS)}. "
+            f"INSERT layers in this file: {insert_layers or ['(none)']}."
+        )
+
+    # ── 8. AP COVERAGE ANALYSIS ───────────────────────────────────
+    coverage = _ap_coverage_analysis(ap_entities, floor_pts, width_m, height_m)
+
+    if coverage["aps_outside_boundary"]:
+        warnings.append(f"APs outside floor boundary: {coverage['aps_outside_boundary']}. Check AP positions in the DXF.")
+    if coverage["dead_zone_risk"]:
+        warnings.append(
+            f"Potential dead zones: {len(ap_entities)} APs for {coverage['floor_area_m2']}m² floor. "
+            f"Recommended: {coverage['recommended_ap_count']} APs (1 per 80m²)."
+        )
+
+    # ── 9. SAVE TO DATABASE ───────────────────────────────────────
+    await db.execute(delete(AccessPoint).where(AccessPoint.area_id == area_id))
+    for ap in ap_entities:
+        db.add(AccessPoint(
+            id=str(uuid.uuid4()),
+            area_id=area_id,
+            ap_id=ap["ap_id"],
+            x_m=ap["x_m"],
+            y_m=ap["y_m"],
+            layer=ap["layer"],
+        ))
+
+    # Stored format MUST match the upload-response shape exactly, so that
+    # selecting an area from the sidebar renders identically to a fresh upload.
+    parsed_data = {
+        "floor_boundary": {
+            "svg_path": floor_svg_path,
+            "points_m": floor_pts,
+            "width_m": round(width_m, 3),
+            "height_m": round(height_m, 3),
+            "viewbox": f"0 0 {vw} {vh}",
+        },
+        "polylines": display_polylines,            # ALL lines (walls + furniture)
+        "structural_polylines": structural_polylines,  # walls only (zone drawing)
+        "access_points": ap_entities,
+        "layers": sorted(layers_found),
+        "unit_code": unit_code,
+        "unit_name": unit_name,
+        "scale": scale,
+        "offset_x": offset_x,
+        "offset_y": offset_y,
+        "viewbox": f"0 0 {vw} {vh}",
+        "coverage": coverage,
+    }
+
+    area.width_m = round(width_m, 3)
+    area.height_m = round(height_m, 3)
+    area.svg_path_data = floor_svg_path
+    area.dxf_parsed_data = parsed_data
+
+    await db.commit()
+    os.unlink(tmp_path)
+
+    return {
+        "area_id": area_id,
+        "floor_boundary": {
+            "svg_path": floor_svg_path,
+            "points_m": floor_pts,
+            "width_m": round(width_m, 3),
+            "height_m": round(height_m, 3),
+            "viewbox": f"0 0 {vw} {vh}",
+        },
+        "access_points": ap_entities,
+        "polylines": display_polylines,
+        "structural_polylines": structural_polylines,
+        "layers": sorted(layers_found),
+        "unit_name": unit_name,
+        "coverage": coverage,
+        "warnings": warnings,
+    }
+
+
+def _shoelace_area(pts):
+    n = len(pts)
+    area = 0
+    for i in range(n):
+        j = (i + 1) % n
+        area += pts[i][0] * pts[j][1]
+        area -= pts[j][0] * pts[i][1]
+    return area / 2
+
+
+# ── ZONES ─────────────────────────────────────────────────────────
+@app.post("/api/zones")
+async def create_zone(body: ZoneCreate, db: AsyncSession = Depends(get_db)):
+    z = Zone(
+        id=str(uuid.uuid4()),
+        area_id=body.area_id,
+        name=body.name,
+        capacity=body.capacity,
+        polygon_json=body.polygon_json,
+        color=body.color,
+        method=body.method,
+    )
+    db.add(z)
+    await db.commit()
+    await db.refresh(z)
+    return _zone_dict(z)
+
+
+@app.get("/api/zones")
+async def list_zones(area_id: Optional[str] = None, db: AsyncSession = Depends(get_db)):
+    q = select(Zone).order_by(Zone.created_at)
+    if area_id:
+        q = q.where(Zone.area_id == area_id)
+    result = await db.execute(q)
+    return [_zone_dict(z) for z in result.scalars().all()]
+
+
+@app.put("/api/zones/{zid}")
+async def update_zone(zid: str, body: ZoneUpdate, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(Zone).where(Zone.id == zid))
+    z = result.scalar_one_or_none()
+    if not z:
+        raise HTTPException(404, "Zone not found")
+    if body.name is not None:
+        z.name = body.name
+    if body.capacity is not None:
+        z.capacity = body.capacity
+    if body.color is not None:
+        z.color = body.color
+    await db.commit()
+    await db.refresh(z)
+    return _zone_dict(z)
+
+
+@app.delete("/api/zones/{zid}")
+async def delete_zone(zid: str, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(Zone).where(Zone.id == zid))
+    z = result.scalar_one_or_none()
+    if not z:
+        raise HTTPException(404, "Zone not found")
+    await db.delete(z)
+    await db.commit()
+    return {"deleted": zid}
+
+
+def _zone_dict(z):
+    return {
+        "id": z.id, "area_id": z.area_id, "name": z.name,
+        "capacity": z.capacity, "polygon_json": z.polygon_json,
+        "color": z.color, "method": z.method,
+        "created_at": str(z.created_at),
+    }
+
+
+def _ap_dict(p):
+    return {"id": p.id, "area_id": p.area_id, "ap_id": p.ap_id,
+            "x_m": p.x_m, "y_m": p.y_m, "layer": p.layer}
+
+
+# ── CSV UPLOAD ────────────────────────────────────────────────────
+@app.post("/api/upload")
+async def upload_csv(
+    file: UploadFile = File(...),
+    area_id: str = Form(...),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(Area).where(Area.id == area_id))
+    area = result.scalar_one_or_none()
+    if not area:
+        raise HTTPException(404, "Area not found")
+
+    contents = await file.read()
+    try:
+        df = pd.read_csv(io.StringIO(contents.decode("utf-8")))
+    except Exception as e:
+        raise HTTPException(400, f"CSV parse error: {e}")
+
+    required = ["timestamp", "mac_address", "ap_id", "ap_x", "ap_y", "rssi"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise HTTPException(400, f"Missing columns: {missing}")
+
+    # Filter by area name if area_name column exists
+    if "area_name" in df.columns:
+        df_area = df[df["area_name"] == area.name]
+        if df_area.empty:
+            names = df["area_name"].unique().tolist()
+            raise HTTPException(400, (
+                f"No rows match area name '{area.name}'. "
+                f"Values in CSV: {names}. area_name is case-sensitive."
+            ))
+        df = df_area
+
+    floor_w = area.width_m or 100
+    floor_h = area.height_m or 60
+
+    # Get zones for this area
+    zones_result = await db.execute(select(Zone).where(Zone.area_id == area_id))
+    zones = zones_result.scalars().all()
+
+    def find_zone(x, y):
+        for z in zones:
+            poly = z.polygon_json
+            if poly and point_in_polygon(x, y, poly):
+                return z.id
+        return None
+
+    # Run triangulation
+    located = []
+    for (ts, mac), grp in df.groupby(["timestamp", "mac_address"]):
+        ap_pos = list(zip(grp["ap_x"].astype(float), grp["ap_y"].astype(float)))
+        distances = [rssi_to_distance(float(r)) for r in grp["rssi"]]
+        est_x, est_y = trilaterate(ap_pos, distances, floor_w, floor_h)
+        area_name = grp["area_name"].iloc[0] if "area_name" in grp.columns else area.name
+        zone_id = find_zone(est_x, est_y)
+        located.append({
+            "mac_hash": hashlib.sha256(str(mac).encode()).hexdigest()[:16],
+            "timestamp": ts,
+            "est_x": est_x,
+            "est_y": est_y,
+            "zone_id": zone_id,
+            "area_name": area_name,
+        })
+
+    # Save upload record
+    upload = RssiUpload(
+        id=str(uuid.uuid4()),
+        area_id=area_id,
+        filename=file.filename,
+        record_count=len(df),
+    )
+    db.add(upload)
+    await db.flush()
+
+    # Save device positions
+    for row in located:
+        try:
+            ts = pd.to_datetime(row["timestamp"]).to_pydatetime()
+        except Exception:
+            ts = datetime.utcnow()
+        db.add(DevicePosition(
+            id=str(uuid.uuid4()),
+            upload_id=upload.id,
+            mac_hash=row["mac_hash"],
+            timestamp=ts,
+            est_x=row["est_x"],
+            est_y=row["est_y"],
+            zone_id=row["zone_id"],
+            area_name=row["area_name"],
+        ))
+
+    await db.commit()
+
+    timestamps_unique = sorted(set(str(r["timestamp"]) for r in located))
+    zones_detected = len(set(r["zone_id"] for r in located if r["zone_id"]))
+
+    return {
+        "upload_id": upload.id,
+        "records_processed": len(df),
+        "devices_located": len(located),
+        "timestamps": len(timestamps_unique),
+        "zones_detected": zones_detected,
+        "area_name_matched": area.name,
+    }
+
+
+# ── OCCUPANCY ─────────────────────────────────────────────────────
+@app.get("/api/occupancy")
+async def get_occupancy(
+    area_id: str,
+    timestamp: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(Area).where(Area.id == area_id))
+    area = result.scalar_one_or_none()
+    if not area:
+        raise HTTPException(404, "Area not found")
+
+    zones_result = await db.execute(select(Zone).where(Zone.area_id == area_id))
+    zones = {z.id: z for z in zones_result.scalars().all()}
+
+    # Get latest upload for this area
+    uploads_result = await db.execute(
+        select(RssiUpload).where(RssiUpload.area_id == area_id).order_by(RssiUpload.uploaded_at.desc())
+    )
+    uploads = uploads_result.scalars().all()
+    if not uploads:
+        return {"zones": [], "total_devices": 0, "most_crowded": None}
+
+    upload_ids = [u.id for u in uploads]
+
+    # Query device positions
+    q = select(DevicePosition).where(DevicePosition.upload_id.in_(upload_ids))
+    if timestamp:
+        try:
+            ts = pd.to_datetime(timestamp)
+            q = q.where(DevicePosition.timestamp == ts)
+        except Exception:
+            pass
+    else:
+        # Get latest timestamp
+        ts_result = await db.execute(
+            select(DevicePosition.timestamp)
+            .where(DevicePosition.upload_id.in_(upload_ids))
+            .order_by(DevicePosition.timestamp.desc())
+            .limit(1)
+        )
+        latest_ts = ts_result.scalar_one_or_none()
+        if latest_ts:
+            q = q.where(DevicePosition.timestamp == latest_ts)
+
+    devs_result = await db.execute(q)
+    devs = devs_result.scalars().all()
+    total = len(devs)
+
+    zone_counts = {}
+    for d in devs:
+        if d.zone_id and d.zone_id in zones:
+            zone_counts[d.zone_id] = zone_counts.get(d.zone_id, 0) + 1
+
+    out_zones = []
+    for zid, z in zones.items():
+        count = zone_counts.get(zid, 0)
+        pct = round(count / max(z.capacity, 1) * 100, 1)
+        out_zones.append({
+            "zone_id": zid,
+            "zone_name": z.name,
+            "devices": count,
+            "capacity": z.capacity,
+            "occupancy_pct": pct,
+            "status": get_zone_status(pct),
+            "color": z.color,
+        })
+
+    out_zones.sort(key=lambda x: -x["occupancy_pct"])
+    most_crowded = out_zones[0]["zone_name"] if out_zones else None
+
+    return {"zones": out_zones, "total_devices": total, "most_crowded": most_crowded}
+
+
+# ── DEVICES ───────────────────────────────────────────────────────
+@app.get("/api/devices")
+async def get_devices(
+    area_id: str,
+    timestamp: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(Area).where(Area.id == area_id))
+    area = result.scalar_one_or_none()
+    if not area:
+        raise HTTPException(404, "Area not found")
+
+    uploads_result = await db.execute(
+        select(RssiUpload).where(RssiUpload.area_id == area_id).order_by(RssiUpload.uploaded_at.desc())
+    )
+    uploads = uploads_result.scalars().all()
+    if not uploads:
+        return {"devices": []}
+
+    upload_ids = [u.id for u in uploads]
+    zones_result = await db.execute(select(Zone).where(Zone.area_id == area_id))
+    zones = {z.id: z for z in zones_result.scalars().all()}
+
+    q = select(DevicePosition).where(DevicePosition.upload_id.in_(upload_ids))
+    if timestamp:
+        try:
+            ts = pd.to_datetime(timestamp)
+            q = q.where(DevicePosition.timestamp == ts)
+        except Exception:
+            pass
+    else:
+        ts_result = await db.execute(
+            select(DevicePosition.timestamp)
+            .where(DevicePosition.upload_id.in_(upload_ids))
+            .order_by(DevicePosition.timestamp.desc())
+            .limit(1)
+        )
+        latest_ts = ts_result.scalar_one_or_none()
+        if latest_ts:
+            q = q.where(DevicePosition.timestamp == latest_ts)
+
+    devs_result = await db.execute(q)
+    devs = devs_result.scalars().all()
+
+    width_m = area.width_m or 100
+    height_m = area.height_m or 60
+
+    out = []
+    for d in devs:
+        sx, sy = meters_to_svg(d.est_x, d.est_y, width_m, height_m)
+        zone_name = zones[d.zone_id].name if d.zone_id and d.zone_id in zones else None
+        out.append({
+            "mac_hash": d.mac_hash,
+            "est_x": d.est_x,
+            "est_y": d.est_y,
+            "x_svg": sx,
+            "y_svg": sy,
+            "zone_id": d.zone_id,
+            "zone_name": zone_name,
+            "timestamp": str(d.timestamp),
+        })
+
+    return {"devices": out}
+
+
+# ── TIMESTAMPS ────────────────────────────────────────────────────
+@app.get("/api/timestamps")
+async def get_timestamps(area_id: str, db: AsyncSession = Depends(get_db)):
+    uploads_result = await db.execute(
+        select(RssiUpload).where(RssiUpload.area_id == area_id)
+    )
+    upload_ids = [u.id for u in uploads_result.scalars().all()]
+    if not upload_ids:
+        return {"timestamps": []}
+
+    ts_result = await db.execute(
+        select(DevicePosition.timestamp)
+        .where(DevicePosition.upload_id.in_(upload_ids))
+        .distinct()
+        .order_by(DevicePosition.timestamp)
+    )
+    timestamps = [str(r[0]) for r in ts_result.all()]
+    return {"timestamps": timestamps}
+
+
+# ── ANALYTICS ─────────────────────────────────────────────────────
+@app.get("/api/analytics")
+async def get_analytics(area_id: str, db: AsyncSession = Depends(get_db)):
+    uploads_result = await db.execute(
+        select(RssiUpload).where(RssiUpload.area_id == area_id).order_by(RssiUpload.uploaded_at)
+    )
+    uploads = uploads_result.scalars().all()
+    if not uploads:
+        return {
+            "hourly_trend": [], "zone_popularity": [],
+            "peak_hour": None, "total_uploads": 0,
+        }
+
+    upload_ids = [u.id for u in uploads]
+    zones_result = await db.execute(select(Zone).where(Zone.area_id == area_id))
+    zones = {z.id: z for z in zones_result.scalars().all()}
+
+    devs_result = await db.execute(
+        select(DevicePosition).where(DevicePosition.upload_id.in_(upload_ids))
+        .order_by(DevicePosition.timestamp)
+    )
+    devs = devs_result.scalars().all()
+
+    # Hourly trend
+    ts_counts = {}
+    for d in devs:
+        key = str(d.timestamp)
+        ts_counts[key] = ts_counts.get(key, 0) + 1
+
+    hourly_trend = [{"timestamp": k, "total_devices": v} for k, v in sorted(ts_counts.items())]
+
+    # Peak hour
+    peak_hour = max(ts_counts, key=ts_counts.get) if ts_counts else None
+
+    # Zone popularity
+    zone_device_counts = {}
+    zone_ts_counts = {}
+    for d in devs:
+        if d.zone_id and d.zone_id in zones:
+            key = str(d.timestamp)
+            if d.zone_id not in zone_device_counts:
+                zone_device_counts[d.zone_id] = {}
+            zone_device_counts[d.zone_id][key] = zone_device_counts[d.zone_id].get(key, 0) + 1
+
+    zone_popularity = []
+    for zid, z in zones.items():
+        if zid in zone_device_counts:
+            ts_pcts = [
+                min(count / max(z.capacity, 1) * 100, 100)
+                for count in zone_device_counts[zid].values()
+            ]
+            avg_pct = round(sum(ts_pcts) / len(ts_pcts), 1)
+        else:
+            avg_pct = 0.0
+        zone_popularity.append({"zone_name": z.name, "avg_occupancy_pct": avg_pct})
+
+    return {
+        "hourly_trend": hourly_trend,
+        "zone_popularity": zone_popularity,
+        "peak_hour": peak_hour,
+        "total_uploads": len(uploads),
+    }
+
+
+# ── LEGACY ENDPOINTS (backwards compat) ───────────────────────────
+@app.post("/upload")
+async def legacy_upload(file: UploadFile = File(...)):
+    return {"error": "Use /api/upload with area_id"}
+
+
+@app.get("/occupancy")
+async def legacy_occupancy():
+    return {"error": "Use /api/occupancy?area_id=xxx"}
+
+
+@app.get("/devices")
+async def legacy_devices():
+    return {"error": "Use /api/devices?area_id=xxx"}
+
+
+@app.get("/timestamps")
+async def legacy_timestamps():
+    return {"error": "Use /api/timestamps?area_id=xxx"}

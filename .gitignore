@@ -1,0 +1,47 @@
+# ─── Secrets / environment ───────────────────────────────
+.env
+.env.*
+!.env.example
+backend/.env
+*.key
+*.pem
+
+# ─── Python ──────────────────────────────────────────────
+venv/
+backend/venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# Temporary diagnostic / test scripts
+backend/test_*.py
+backend/diag*.py
+backend/t.py
+
+# ─── Node / React ────────────────────────────────────────
+node_modules/
+frontend/node_modules/
+frontend/build/
+frontend/.eslintcache
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ─── Editor / OS ─────────────────────────────────────────
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+
+# ─── Logs / scratch ──────────────────────────────────────
+*.log
+scratchpad/
+
+# ─── Uploaded / generated data (keep sample CAD + CSV) ───
+data/uploads/
+*.tmp

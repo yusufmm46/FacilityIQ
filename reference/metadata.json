@@ -1,0 +1,6 @@
+{
+  "name": "FacilityIQ",
+  "description": "Occupancy intelligence and facility space management platform with live heatmaps, interactive floor plans, analytics, and control center.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

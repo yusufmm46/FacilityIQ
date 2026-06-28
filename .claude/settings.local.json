@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(./venv/Scripts/pip install *)",
+      "Bash(./backend/venv/Scripts/python core/generate_test_dxf.py)",
+      "Bash(./backend/venv/Scripts/python core/generate_sample_csv.py)",
+      "Bash(./venv/Scripts/python -c \"import sys; sys.path.insert\\(0, '.'\\); import database; import models; print\\('imports OK'\\)\")"
+    ]
+  }
+}
