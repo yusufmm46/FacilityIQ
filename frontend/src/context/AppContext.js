@@ -1,7 +1,10 @@
 import React, { createContext, useContext, useState, useCallback } from 'react';
 import axios from 'axios';
 
-const API = 'http://127.0.0.1:8000/api';
+// API base URL — set REACT_APP_API_URL in production (e.g. on Vercel) to the
+// deployed backend URL. Falls back to local backend for development.
+const API_BASE = process.env.REACT_APP_API_URL || 'http://127.0.0.1:8000';
+const API = `${API_BASE}/api`;
 
 const AppContext = createContext(null);
 

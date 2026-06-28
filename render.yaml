@@ -1,0 +1,19 @@
+# Render Blueprint — deploys the FastAPI backend.
+# In Render: New → Blueprint → connect this repo. Then set the three
+# environment variables below in the dashboard (they are marked sync:false
+# so they are NOT committed to git).
+services:
+  - type: web
+    name: facilityiq-backend
+    runtime: python
+    rootDir: backend
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
+      - key: SUPABASE_DB_URL
+        sync: false
