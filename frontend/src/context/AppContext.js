@@ -30,6 +30,10 @@ export function AppProvider({ children }) {
   const [deviceData, setDeviceData] = useState(null);
   const [analyticsData, setAnalyticsData] = useState(null);
 
+  // Live Wi-Fi stream (Phase 2)
+  const [liveData, setLiveData] = useState(null);       // /api/stream/live for selected area
+  const [liveStatus, setLiveStatus] = useState(null);   // /api/stream/status (all areas)
+
   const [currentView, setCurrentView] = useState('dashboard');
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState(null);
@@ -142,6 +146,28 @@ export function AppProvider({ children }) {
         params: { area_id: areaId, timestamp },
       });
       setDeviceData(res.data);
+      return res.data;
+    } catch (e) {
+      return null;
+    }
+  }, []);
+
+  // ── Live stream (Phase 2) ──────────────────────────────────────
+  const loadLive = useCallback(async (areaName) => {
+    if (!areaName) return null;
+    try {
+      const res = await axios.get(`${API}/stream/live`, { params: { area_name: areaName } });
+      setLiveData(res.data);
+      return res.data;
+    } catch (e) {
+      return null;
+    }
+  }, []);
+
+  const loadLiveStatus = useCallback(async () => {
+    try {
+      const res = await axios.get(`${API}/stream/status`);
+      setLiveStatus(res.data);
       return res.data;
     } catch (e) {
       return null;
@@ -382,6 +408,7 @@ export function AppProvider({ children }) {
     dxfData, zones, accessPoints,
     uploadedData, timestamps, selectedTimestamp,
     occupancyData, deviceData, analyticsData,
+    liveData, liveStatus,
     currentView, isLoading, error, notification,
 
     // Actions
@@ -393,6 +420,7 @@ export function AppProvider({ children }) {
     createArea, deleteArea,
     uploadDXF, createZone, updateZone, deleteZone,
     uploadCSV, loadOccupancy, loadDevices, loadAnalytics,
+    loadLive, loadLiveStatus,
     setSelectedTimestamp,
     showNotification,
     setCurrentView,

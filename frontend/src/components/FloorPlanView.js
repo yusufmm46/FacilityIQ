@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { ZoomIn, ZoomOut, Compass } from 'lucide-react';
 import { useApp } from '../context/AppContext';
 
@@ -97,11 +97,13 @@ function buildFlowArrows(zones, occupancyByZone, width_m, height_m, vw, vh) {
   return arrows;
 }
 
+const LIVE_POLL_MS = 30000;  // poll live stream every 30s
+
 export default function FloorPlanView() {
   const {
     selectedArea, dxfData, zones, accessPoints,
     occupancyData, deviceData, timestamps, selectedTimestamp,
-    setSelectedTimestamp, isLoading,
+    setSelectedTimestamp, isLoading, liveData, loadLive,
   } = useApp();
 
   const [activeTab, setActiveTab] = useState('heatmap');
@@ -109,6 +111,21 @@ export default function FloorPlanView() {
   const [statusFilter, setStatusFilter] = useState('All');
   const [tooltip, setTooltip] = useState(null);
   const [zoom, setZoom] = useState(1);
+  const [tick, setTick] = useState(0);  // re-render every second for "Xs ago"
+
+  // Auto-poll the live stream for the selected area every 30s
+  useEffect(() => {
+    if (!selectedArea?.name) return;
+    loadLive(selectedArea.name);
+    const id = setInterval(() => loadLive(selectedArea.name), LIVE_POLL_MS);
+    return () => clearInterval(id);
+  }, [selectedArea?.name, loadLive]);
+
+  // 1-second ticker so the "last updated" label counts up
+  useEffect(() => {
+    const id = setInterval(() => setTick(t => t + 1), 1000);
+    return () => clearInterval(id);
+  }, []);
 
   const vw = 1000, vh = 600;
   const fb = dxfData?.floor_boundary;
@@ -116,9 +133,28 @@ export default function FloorPlanView() {
   const width_m = fb?.width_m || selectedArea?.width_m || 100;
   const height_m = fb?.height_m || selectedArea?.height_m || 60;
 
+  // Prefer LIVE stream data; fall back to CSV-based occupancy/devices.
+  const liveForArea = liveData && liveData.area_name === selectedArea?.name ? liveData : null;
+  const zoneSource = liveForArea ? liveForArea.zones : (occupancyData?.zones || []);
+  const allDevices = liveForArea ? liveForArea.devices : (deviceData?.devices || []);
+
+  // Record when each live payload arrived, so "Xs ago" can tick up locally.
+  const liveRecvRef = useRef({ key: null, at: 0, base: null });
+  const liveKey = liveForArea ? `${liveForArea.area_name}|${liveForArea.last_updated}` : null;
+  if (liveKey && liveRecvRef.current.key !== liveKey) {
+    liveRecvRef.current = { key: liveKey, at: Date.now(), base: liveForArea.seconds_ago || 0 };
+  }
+  const hasLivePayload = !!liveForArea && liveForArea.last_updated;
+  const secondsAgo = hasLivePayload
+    ? liveRecvRef.current.base + Math.floor((Date.now() - liveRecvRef.current.at) / 1000)
+    : null;
+  // "live" if data refreshed within the last 60s (recomputed client-side via tick)
+  const isLive = secondsAgo !== null && secondsAgo <= 60;
+  void tick;  // tick drives the re-render that recomputes secondsAgo
+
   // Build occupancy lookup by zone id
   const occupancyByZone = {};
-  (occupancyData?.zones || []).forEach(z => { occupancyByZone[z.zone_id] = z; });
+  (zoneSource || []).forEach(z => { occupancyByZone[z.zone_id] = z; });
 
   const filteredZones = zones.filter(z => {
     if (statusFilter === 'All') return true;
@@ -127,7 +163,6 @@ export default function FloorPlanView() {
     return getZoneConfig(pct).status === statusFilter.toUpperCase();
   });
 
-  const allDevices = deviceData?.devices || [];
   const flowArrows = activeTab === 'flow'
     ? buildFlowArrows(zones, occupancyByZone, width_m, height_m, vw, vh)
     : [];
@@ -139,17 +174,29 @@ export default function FloorPlanView() {
       <section className="px-6 py-4 flex flex-wrap gap-4 items-center justify-between border-b border-slate-100 z-10 bg-white">
         <div className="flex items-center gap-3">
           <div className="bg-white px-4 py-2 rounded-xl shadow-sm border border-slate-100 flex items-center gap-3">
-            <span className={`w-2.5 h-2.5 rounded-full ${timestamps.length > 0 ? 'bg-status-success animate-pulse' : 'bg-slate-300'}`} />
             <span className="text-[10px] font-mono font-bold text-on-surface uppercase tracking-wider">
               {selectedArea ? selectedArea.name : 'No area selected'}
             </span>
-            {selectedTimestamp && (
-              <>
-                <div className="h-4 w-px bg-slate-200" />
-                <span className="text-[10px] text-on-surface-variant font-mono font-semibold">{selectedTimestamp}</span>
-              </>
-            )}
           </div>
+
+          {/* Live stream indicator */}
+          {selectedArea && (
+            <div className={`px-4 py-2 rounded-xl shadow-sm border flex items-center gap-2.5 ${
+              isLive ? 'bg-green-50 border-green-200' : 'bg-amber-50 border-amber-200'
+            }`}>
+              <span className="relative flex h-2.5 w-2.5">
+                {isLive && <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75" />}
+                <span className={`relative inline-flex rounded-full h-2.5 w-2.5 ${isLive ? 'bg-green-500' : 'bg-amber-400'}`} />
+              </span>
+              <span className={`text-[10px] font-mono font-bold uppercase tracking-wider ${isLive ? 'text-green-700' : 'text-amber-700'}`}>
+                {isLive
+                  ? `Live · updated ${secondsAgo}s ago`
+                  : hasLivePayload
+                    ? `Waiting for live data… (last ${secondsAgo}s ago)`
+                    : 'Waiting for live data…'}
+              </span>
+            </div>
+          )}
 
           <div className="flex items-center bg-slate-100 p-1 rounded-xl shadow-inner border border-slate-100">
             {[
@@ -513,8 +560,8 @@ export default function FloorPlanView() {
       <footer className="h-16 bg-white border-t border-slate-100 px-6 flex items-center justify-between z-30 shrink-0 select-none">
         <div className="flex items-center gap-8">
           {[
-            { label: 'Total Occupants', val: occupancyData?.total_devices ?? allDevices.length },
-            { label: 'Busiest Zone',    val: occupancyData?.most_crowded || '—', colored: true },
+            { label: 'Total Occupants', val: liveForArea ? liveForArea.total_devices : (occupancyData?.total_devices ?? allDevices.length) },
+            { label: 'Busiest Zone',    val: (liveForArea ? liveForArea.most_crowded : occupancyData?.most_crowded) || '—', colored: true },
             { label: 'Active APs',      val: `${accessPoints.length}` },
           ].map(({ label, val, colored }) => (
             <div key={label} className="flex items-center gap-2">

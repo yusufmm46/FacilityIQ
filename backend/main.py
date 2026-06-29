@@ -5,8 +5,8 @@ import json
 import hashlib
 import tempfile
 import uuid
-from datetime import datetime
-from typing import Optional
+from datetime import datetime, timezone
+from typing import Optional, List
 
 import numpy as np
 import pandas as pd
@@ -1160,6 +1160,232 @@ async def get_analytics(area_id: str, db: AsyncSession = Depends(get_db)):
         "peak_hour": peak_hour,
         "total_uploads": len(uploads),
     }
+
+
+# ── LIVE WI-FI STREAM (Phase 2) ───────────────────────────────────
+# A real Wi-Fi controller (or the simulator) POSTs RSSI batches to
+# /api/stream/ingest. We triangulate, store a single "live" snapshot per
+# area (filename "__live__<area>"), and the frontend polls /api/stream/live.
+
+LIVE_PREFIX = "__live__"
+LIVE_STALE_SECONDS = 60  # data older than this is considered "not live"
+
+
+class StreamReading(BaseModel):
+    area_name: str
+    mac_address: str
+    ap_id: str
+    ap_x: float
+    ap_y: float
+    rssi: float
+
+
+class StreamBatch(BaseModel):
+    source: Optional[str] = "unknown"
+    batch_timestamp: Optional[str] = None
+    readings: List[StreamReading]
+
+
+def _seconds_ago(dt):
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return max(0, int((datetime.now(timezone.utc) - dt).total_seconds()))
+
+
+@app.post("/api/stream/ingest")
+async def stream_ingest(batch: StreamBatch, db: AsyncSession = Depends(get_db)):
+    if not batch.readings:
+        raise HTTPException(400, "Empty batch: no readings provided")
+
+    # Group readings by area name
+    by_area = {}
+    for r in batch.readings:
+        by_area.setdefault(r.area_name, []).append(r)
+
+    now = datetime.now(timezone.utc)
+    results = []
+    unmatched_areas = []
+
+    for area_name, readings in by_area.items():
+        # Match area by exact name (case-sensitive, like CSV flow)
+        res = await db.execute(select(Area).where(Area.name == area_name))
+        area = res.scalar_one_or_none()
+        if not area:
+            unmatched_areas.append(area_name)
+            continue
+
+        floor_w = area.width_m or 100
+        floor_h = area.height_m or 60
+
+        zones_res = await db.execute(select(Zone).where(Zone.area_id == area.id))
+        zones = zones_res.scalars().all()
+
+        def find_zone(x, y):
+            for z in zones:
+                if z.polygon_json and point_in_polygon(x, y, z.polygon_json):
+                    return z.id
+            return None
+
+        # Triangulate per device (group readings by mac)
+        by_mac = {}
+        for r in readings:
+            by_mac.setdefault(r.mac_address, []).append(r)
+
+        located = []
+        for mac, rows in by_mac.items():
+            ap_pos = [(rw.ap_x, rw.ap_y) for rw in rows]
+            distances = [rssi_to_distance(rw.rssi) for rw in rows]
+            est_x, est_y = trilaterate(ap_pos, distances, floor_w, floor_h)
+            located.append({
+                "mac_hash": hashlib.sha256(mac.encode()).hexdigest()[:16],
+                "est_x": est_x, "est_y": est_y,
+                "zone_id": find_zone(est_x, est_y),
+            })
+
+        # Replace the single live snapshot for this area
+        live_name = f"{LIVE_PREFIX}{area_name}"
+        old = await db.execute(
+            select(RssiUpload).where(
+                RssiUpload.area_id == area.id, RssiUpload.filename == live_name
+            )
+        )
+        for u in old.scalars().all():
+            await db.delete(u)
+        await db.flush()
+
+        upload = RssiUpload(
+            id=str(uuid.uuid4()), area_id=area.id,
+            filename=live_name, record_count=len(readings),
+        )
+        db.add(upload)
+        await db.flush()
+
+        for d in located:
+            db.add(DevicePosition(
+                id=str(uuid.uuid4()), upload_id=upload.id,
+                mac_hash=d["mac_hash"], timestamp=now,
+                est_x=d["est_x"], est_y=d["est_y"],
+                zone_id=d["zone_id"], area_name=area_name,
+            ))
+
+        results.append({
+            "area_name": area_name,
+            "devices_located": len(located),
+            "readings": len(readings),
+        })
+
+    await db.commit()
+
+    return {
+        "status": "ok",
+        "received_at": now.isoformat(),
+        "source": batch.source,
+        "areas_processed": results,
+        "unmatched_areas": unmatched_areas,
+    }
+
+
+async def _live_snapshot(area, db):
+    """Build the live occupancy snapshot for one area (or None if no live data)."""
+    live_name = f"{LIVE_PREFIX}{area.name}"
+    res = await db.execute(
+        select(RssiUpload).where(
+            RssiUpload.area_id == area.id, RssiUpload.filename == live_name
+        ).order_by(RssiUpload.uploaded_at.desc())
+    )
+    upload = res.scalars().first()  # tolerate duplicates: newest wins
+    if not upload:
+        return None
+
+    zones_res = await db.execute(select(Zone).where(Zone.area_id == area.id))
+    zones = {z.id: z for z in zones_res.scalars().all()}
+
+    devs_res = await db.execute(
+        select(DevicePosition).where(DevicePosition.upload_id == upload.id)
+    )
+    devs = devs_res.scalars().all()
+
+    width_m = area.width_m or 100
+    height_m = area.height_m or 60
+
+    device_list, zone_counts = [], {}
+    for d in devs:
+        sx, sy = meters_to_svg(d.est_x, d.est_y, width_m, height_m)
+        zname = zones[d.zone_id].name if d.zone_id in zones else None
+        if d.zone_id in zones:
+            zone_counts[d.zone_id] = zone_counts.get(d.zone_id, 0) + 1
+        device_list.append({
+            "mac_hash": d.mac_hash, "est_x": d.est_x, "est_y": d.est_y,
+            "x_svg": sx, "y_svg": sy, "zone_id": d.zone_id, "zone_name": zname,
+        })
+
+    out_zones = []
+    for zid, z in zones.items():
+        count = zone_counts.get(zid, 0)
+        pct = round(count / max(z.capacity, 1) * 100, 1)
+        out_zones.append({
+            "zone_id": zid, "zone_name": z.name, "devices": count,
+            "capacity": z.capacity, "occupancy_pct": pct,
+            "status": get_zone_status(pct), "color": z.color,
+        })
+    out_zones.sort(key=lambda x: -x["occupancy_pct"])
+
+    secs = _seconds_ago(upload.uploaded_at)
+    return {
+        "area_id": area.id,
+        "area_name": area.name,
+        "last_updated": str(upload.uploaded_at),
+        "seconds_ago": secs,
+        "is_live": secs is not None and secs <= LIVE_STALE_SECONDS,
+        "total_devices": len(device_list),
+        "most_crowded": out_zones[0]["zone_name"] if out_zones and out_zones[0]["devices"] else None,
+        "devices": device_list,
+        "zones": out_zones,
+    }
+
+
+@app.get("/api/stream/live")
+async def stream_live(area_name: str, db: AsyncSession = Depends(get_db)):
+    res = await db.execute(select(Area).where(Area.name == area_name))
+    area = res.scalar_one_or_none()
+    if not area:
+        raise HTTPException(404, f"Area '{area_name}' not found")
+    snap = await _live_snapshot(area, db)
+    if snap is None:
+        return {
+            "area_name": area_name, "area_id": area.id,
+            "is_live": False, "seconds_ago": None, "last_updated": None,
+            "total_devices": 0, "most_crowded": None,
+            "devices": [], "zones": [],
+            "message": "Waiting for live data...",
+        }
+    return snap
+
+
+@app.get("/api/stream/status")
+async def stream_status(db: AsyncSession = Depends(get_db)):
+    areas_res = await db.execute(select(Area))
+    areas = areas_res.scalars().all()
+    out = []
+    for area in areas:
+        snap = await _live_snapshot(area, db)
+        if snap is None:
+            out.append({
+                "area_name": area.name, "area_id": area.id,
+                "is_live": False, "seconds_ago": None,
+                "total_devices": 0, "most_crowded": None,
+            })
+        else:
+            out.append({
+                "area_name": snap["area_name"], "area_id": snap["area_id"],
+                "is_live": snap["is_live"], "seconds_ago": snap["seconds_ago"],
+                "last_updated": snap["last_updated"],
+                "total_devices": snap["total_devices"],
+                "most_crowded": snap["most_crowded"],
+            })
+    return {"server_time": datetime.now(timezone.utc).isoformat(), "areas": out}
 
 
 # ── LEGACY ENDPOINTS (backwards compat) ───────────────────────────
