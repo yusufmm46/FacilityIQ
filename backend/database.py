@@ -1,6 +1,7 @@
 import os
 from urllib.parse import quote_plus
 from dotenv import load_dotenv
+from sqlalchemy.pool import NullPool
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase
 
@@ -46,14 +47,27 @@ if _is_pooler:
         "prepared_statement_name_func": lambda: f"__asyncpg_{_uuid.uuid4()}__",
     }
 
-engine = create_async_engine(
-    ASYNC_DB_URL,
-    echo=False,
-    pool_size=5,
-    max_overflow=10,
-    pool_pre_ping=True,
-    connect_args=_connect_args,
-)
+if _is_pooler:
+    # Behind Supabase's transaction pooler, SQLAlchemy must NOT keep its own
+    # connection pool — the pooler reassigns the underlying DB connection
+    # between checkouts, which breaks prepared statements held by a pooled
+    # connection. Use NullPool so every checkout is a fresh connection that
+    # Supavisor manages, and disable the asyncpg statement cache (set above).
+    engine = create_async_engine(
+        ASYNC_DB_URL,
+        echo=False,
+        poolclass=NullPool,
+        connect_args=_connect_args,
+    )
+else:
+    engine = create_async_engine(
+        ASYNC_DB_URL,
+        echo=False,
+        pool_size=5,
+        max_overflow=10,
+        pool_pre_ping=True,
+        connect_args=_connect_args,
+    )
 
 AsyncSessionLocal = async_sessionmaker(
     engine,
