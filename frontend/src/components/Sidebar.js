@@ -1,18 +1,20 @@
 import React, { useState, useEffect } from 'react';
-import { Building2, Building, Layers, TrendingUp, ShieldAlert, Settings, ChevronRight, ChevronDown, MapPin, Plus, Wrench } from 'lucide-react';
+import { Building2, Building, Layers, TrendingUp, Settings, ChevronRight, ChevronDown, MapPin, Plus, Wrench } from 'lucide-react';
 import { useApp } from '../context/AppContext';
 
 const bottomNav = [
   { view: 'analytics', label: 'Analytics', icon: TrendingUp },
   { view: 'area-setup', label: 'Area Setup', icon: Wrench },
-  { view: 'data-import', label: 'Data Sync', icon: ShieldAlert },
   { view: 'settings', label: 'System Settings', icon: Settings },
 ];
+
+const LIVE_POLL_MS = 30000;
 
 export default function Sidebar({ currentView, onViewChange, onLogout }) {
   const {
     buildings, floors, areas, selectedAreaId,
     loadBuildings, loadFloors, loadAreas, selectArea,
+    liveStatus, loadLiveStatus,
   } = useApp();
 
   const [expandedBuildings, setExpandedBuildings] = useState({});
@@ -21,6 +23,16 @@ export default function Sidebar({ currentView, onViewChange, onLogout }) {
   useEffect(() => {
     loadBuildings();
   }, []);
+
+  // Poll live status so each area's dot reflects whether it's streaming
+  useEffect(() => {
+    loadLiveStatus();
+    const id = setInterval(loadLiveStatus, LIVE_POLL_MS);
+    return () => clearInterval(id);
+  }, [loadLiveStatus]);
+
+  const liveByName = {};
+  (liveStatus?.areas || []).forEach(a => { liveByName[a.area_name] = a.is_live; });
 
   const toggleBuilding = async (bid) => {
     const next = !expandedBuildings[bid];
@@ -151,8 +163,9 @@ export default function Sidebar({ currentView, onViewChange, onLogout }) {
                               <p className="text-xs text-slate-400 px-3 py-1">No areas</p>
                             )}
                             {fAreas.map(area => {
-                              const hasData = area.dxf_parsed_data || (area.zones && area.zones.length > 0);
                               const isSelected = selectedAreaId === area.id;
+                              const isLive = liveByName[area.name];
+                              const hasSetup = area.dxf_parsed_data || (area.zones && area.zones.length > 0);
                               return (
                                 <button
                                   key={area.id}
@@ -165,7 +178,11 @@ export default function Sidebar({ currentView, onViewChange, onLogout }) {
                                 >
                                   <MapPin className="w-3 h-3 shrink-0" />
                                   <span className="font-sans text-xs truncate">{area.name}</span>
-                                  <div className={`ml-auto w-2 h-2 rounded-full shrink-0 ${hasData ? 'bg-status-success' : 'bg-slate-300'}`} />
+                                  {/* Live = pulsing green, set-up-but-idle = grey-green, no setup = grey */}
+                                  <span className="ml-auto relative flex h-2 w-2 shrink-0" title={isLive ? 'Streaming live' : hasSetup ? 'Ready (no live data)' : 'Not set up'}>
+                                    {isLive && <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75" />}
+                                    <span className={`relative inline-flex rounded-full h-2 w-2 ${isLive ? 'bg-status-success' : hasSetup ? 'bg-teal-200' : 'bg-slate-300'}`} />
+                                  </span>
                                 </button>
                               );
                             })}

@@ -23,20 +23,13 @@ export function AppProvider({ children }) {
   const [zones, setZones] = useState([]);
   const [accessPoints, setAccessPoints] = useState([]);
 
-  const [uploadedData, setUploadedData] = useState(null);
-  const [timestamps, setTimestamps] = useState([]);
-  const [selectedTimestamp, setSelectedTimestampState] = useState(null);
-  const [occupancyData, setOccupancyData] = useState(null);
-  const [deviceData, setDeviceData] = useState(null);
-  const [analyticsData, setAnalyticsData] = useState(null);
-
-  // Live Wi-Fi stream (Phase 2)
+  // Live Wi-Fi stream
   const [liveData, setLiveData] = useState(null);       // /api/stream/live for selected area
   const [liveStatus, setLiveStatus] = useState(null);   // /api/stream/status (all areas)
 
   const [currentView, setCurrentView] = useState('dashboard');
   const [isLoading, setIsLoading] = useState(false);
-  const [error, setError] = useState(null);
+  const [error] = useState(null);
   const [notification, setNotification] = useState(null);
 
   const showNotification = useCallback((type, message) => {
@@ -96,63 +89,7 @@ export function AppProvider({ children }) {
     }
   }, [showNotification]);
 
-  const selectArea = useCallback(async (areaId) => {
-    setSelectedAreaId(areaId);
-    setIsLoading(true);
-    try {
-      // Find area in local state or fetch
-      const found = areas.find(a => a.id === areaId);
-      if (found) {
-        setSelectedArea(found);
-        setZones(found.zones || []);
-        setAccessPoints(found.access_points || []);
-        if (found.dxf_parsed_data) setDxfData(found.dxf_parsed_data);
-      }
-      // Load timestamps
-      const tsRes = await axios.get(`${API}/timestamps`, { params: { area_id: areaId } });
-      const tsList = tsRes.data.timestamps || [];
-      setTimestamps(tsList);
-      if (tsList.length > 0) {
-        const latest = tsList[tsList.length - 1];
-        setSelectedTimestampState(latest);
-        await Promise.all([
-          loadOccupancy(areaId, latest),
-          loadDevices(areaId, latest),
-        ]);
-      }
-      await loadAnalytics(areaId);
-    } catch (e) {
-      // silent — area may have no data yet
-    } finally {
-      setIsLoading(false);
-    }
-  }, [areas]);
-
-  const loadOccupancy = useCallback(async (areaId, timestamp) => {
-    try {
-      const res = await axios.get(`${API}/occupancy`, {
-        params: { area_id: areaId, timestamp },
-      });
-      setOccupancyData(res.data);
-      return res.data;
-    } catch (e) {
-      return null;
-    }
-  }, []);
-
-  const loadDevices = useCallback(async (areaId, timestamp) => {
-    try {
-      const res = await axios.get(`${API}/devices`, {
-        params: { area_id: areaId, timestamp },
-      });
-      setDeviceData(res.data);
-      return res.data;
-    } catch (e) {
-      return null;
-    }
-  }, []);
-
-  // ── Live stream (Phase 2) ──────────────────────────────────────
+  // ── Live stream ────────────────────────────────────────────────
   const loadLive = useCallback(async (areaName) => {
     if (!areaName) return null;
     try {
@@ -174,25 +111,24 @@ export function AppProvider({ children }) {
     }
   }, []);
 
-  const loadAnalytics = useCallback(async (areaId) => {
+  const selectArea = useCallback(async (areaId) => {
+    setSelectedAreaId(areaId);
+    setIsLoading(true);
     try {
-      const res = await axios.get(`${API}/analytics`, { params: { area_id: areaId } });
-      setAnalyticsData(res.data);
-      return res.data;
+      const found = areas.find(a => a.id === areaId);
+      if (found) {
+        setSelectedArea(found);
+        setZones(found.zones || []);
+        setAccessPoints(found.access_points || []);
+        setDxfData(found.dxf_parsed_data || null);
+        await loadLive(found.name);  // load live occupancy for this area
+      }
     } catch (e) {
-      return null;
+      // silent — area may have no live data yet
+    } finally {
+      setIsLoading(false);
     }
-  }, []);
-
-  const setSelectedTimestamp = useCallback(async (ts) => {
-    setSelectedTimestampState(ts);
-    if (selectedAreaId) {
-      await Promise.all([
-        loadOccupancy(selectedAreaId, ts),
-        loadDevices(selectedAreaId, ts),
-      ]);
-    }
-  }, [selectedAreaId, loadOccupancy, loadDevices]);
+  }, [areas, loadLive]);
 
   const uploadDXF = useCallback(async (file, areaId) => {
     const form = new FormData();
@@ -206,7 +142,6 @@ export function AppProvider({ children }) {
       setDxfData(res.data);
       setAccessPoints(res.data.access_points || []);
       showNotification('success', `DXF parsed: ${res.data.access_points?.length || 0} APs found`);
-      // Refresh area
       const aid = areaId || selectedAreaId;
       if (aid) await refreshArea(aid);
       return res.data;
@@ -217,6 +152,7 @@ export function AppProvider({ children }) {
     } finally {
       setIsLoading(false);
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedAreaId, showNotification]);
 
   const refreshArea = useCallback(async (areaId) => {
@@ -267,40 +203,6 @@ export function AppProvider({ children }) {
       throw e;
     }
   }, [showNotification]);
-
-  const uploadCSV = useCallback(async (file, areaId) => {
-    const form = new FormData();
-    form.append('file', file);
-    form.append('area_id', areaId);
-    setIsLoading(true);
-    try {
-      const res = await axios.post(`${API}/upload`, form, {
-        headers: { 'Content-Type': 'multipart/form-data' },
-      });
-      setUploadedData(res.data);
-      showNotification('success', `Processed ${res.data.records_processed} records, ${res.data.devices_located} devices located`);
-      // Reload occupancy data
-      const tsRes = await axios.get(`${API}/timestamps`, { params: { area_id: areaId } });
-      const tsList = tsRes.data.timestamps || [];
-      setTimestamps(tsList);
-      if (tsList.length > 0) {
-        const latest = tsList[tsList.length - 1];
-        setSelectedTimestampState(latest);
-        await Promise.all([
-          loadOccupancy(areaId, latest),
-          loadDevices(areaId, latest),
-          loadAnalytics(areaId),
-        ]);
-      }
-      return res.data;
-    } catch (e) {
-      const msg = e.response?.data?.detail || e.message;
-      showNotification('error', `Upload failed: ${msg}`);
-      throw e;
-    } finally {
-      setIsLoading(false);
-    }
-  }, [showNotification, loadOccupancy, loadDevices, loadAnalytics]);
 
   const createBuilding = useCallback(async (data) => {
     try {
@@ -406,8 +308,6 @@ export function AppProvider({ children }) {
     selectedFloorId, setSelectedFloorId,
     selectedAreaId, selectedArea,
     dxfData, zones, accessPoints,
-    uploadedData, timestamps, selectedTimestamp,
-    occupancyData, deviceData, analyticsData,
     liveData, liveStatus,
     currentView, isLoading, error, notification,
 
@@ -419,9 +319,7 @@ export function AppProvider({ children }) {
     createFloor, deleteFloor,
     createArea, deleteArea,
     uploadDXF, createZone, updateZone, deleteZone,
-    uploadCSV, loadOccupancy, loadDevices, loadAnalytics,
     loadLive, loadLiveStatus,
-    setSelectedTimestamp,
     showNotification,
     setCurrentView,
   };

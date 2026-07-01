@@ -4,7 +4,7 @@ import { useApp } from '../context/AppContext';
 
 const ZONE_COLORS = ['#3B82F6', '#10B981', '#F59E0B', '#EF4444', '#8B5CF6', '#EC4899'];
 
-const STEPS = ['Upload DXF', 'Draw Zones', 'Upload CSV'];
+const STEPS = ['Upload DXF', 'Draw Zones', 'Go Live'];
 
 function StepIndicator({ step }) {
   return (
@@ -64,8 +64,8 @@ function Step1DXF({ areas, selectedAreaId, setSelectedAreaId, onDone }) {
           <div className="mt-3 p-3 bg-amber-50 border border-amber-200 rounded-xl flex gap-2">
             <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
             <p className="text-xs text-amber-800">
-              Area name <strong>"{areas.find(a => a.id === selectedAreaId)?.name}"</strong> must exactly match{' '}
-              <code className="bg-amber-100 px-1 rounded">area_name</code> in your CSV file.
+              Area name <strong>"{areas.find(a => a.id === selectedAreaId)?.name}"</strong> must exactly match the{' '}
+              <code className="bg-amber-100 px-1 rounded">area_name</code> your Wi-Fi controller sends (case-sensitive).
             </p>
           </div>
         )}
@@ -478,7 +478,7 @@ function Step2Zones({ selectedAreaId, onDone }) {
       )}
 
       <button onClick={onDone} className="w-full py-3 bg-secondary text-white font-bold text-sm rounded-full hover:opacity-90 transition-all">
-        Proceed to CSV Upload →
+        Proceed to Go Live →
       </button>
 
       {/* Zone Name Modal */}
@@ -542,104 +542,54 @@ function shoelaceArea(pts) {
   return area / 2;
 }
 
-// ── STEP 3: CSV UPLOAD ────────────────────────────────────────────
-function Step3CSV({ selectedAreaId, areas, onDone }) {
-  const { uploadCSV, isLoading, uploadedData } = useApp();
-  const [dragging, setDragging] = useState(false);
-  const [file, setFile] = useState(null);
-  const [logs, setLogs] = useState([]);
-  const inputRef = useRef();
-  const areaName = areas.find(a => a.id === selectedAreaId)?.name;
-
-  const addLog = (text, type = 'info') => {
-    const time = new Date().toLocaleTimeString('en-US', { hour12: false });
-    setLogs(prev => [...prev, { time, type, text }]);
-  };
-
-  const handleDrop = (e) => {
-    e.preventDefault();
-    setDragging(false);
-    const f = e.dataTransfer.files[0];
-    if (f) setFile(f);
-  };
-
-  const handleUpload = async () => {
-    if (!file || !selectedAreaId) return;
-    addLog(`Uploading ${file.name}...`, 'info');
-    try {
-      const result = await uploadCSV(file, selectedAreaId);
-      addLog(`Processed ${result.records_processed} records`, 'success');
-      addLog(`Located ${result.devices_located} devices`, 'success');
-      addLog(`Detected ${result.zones_detected} zones with data`, 'success');
-    } catch (e) {
-      addLog(`Error: ${e.response?.data?.detail || e.message}`, 'error');
-    }
-  };
+// ── STEP 3: GO LIVE ───────────────────────────────────────────────
+function Step3GoLive({ selectedAreaId, areas, onDone }) {
+  const area = areas.find(a => a.id === selectedAreaId);
+  const areaName = area?.name;
+  const apCount = area?.access_points?.length ?? area?.dxf_parsed_data?.access_points?.length ?? 0;
+  const zoneCount = area?.zones?.length ?? 0;
+  const ready = apCount > 0 && zoneCount > 0;
 
   return (
     <div className="space-y-5">
-      <div className="glass-card p-4 rounded-2xl border border-amber-200 bg-amber-50 flex gap-2">
-        <AlertTriangle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
-        <div>
-          <p className="font-sans font-bold text-amber-800 text-sm">CSV must match area name exactly</p>
-          <p className="text-xs text-amber-700 mt-1">
-            Selected area: <strong>{areaName}</strong>. Your CSV's <code>area_name</code> column must be exactly this value (case-sensitive).
-          </p>
-        </div>
-      </div>
-
-      <div
-        className={`border-2 border-dashed rounded-2xl p-10 text-center cursor-pointer transition-all ${
-          dragging ? 'border-secondary bg-teal-50' : 'border-slate-200 hover:border-secondary hover:bg-slate-50'
-        }`}
-        onDragOver={e => { e.preventDefault(); setDragging(true); }}
-        onDragLeave={() => setDragging(false)}
-        onDrop={handleDrop}
-        onClick={() => inputRef.current?.click()}
-      >
-        <input ref={inputRef} type="file" accept=".csv" className="hidden" onChange={e => setFile(e.target.files[0])} />
-        <Upload className="w-10 h-10 text-slate-400 mx-auto mb-3" />
-        {file ? (
-          <p className="font-bold text-primary text-sm">{file.name}</p>
-        ) : (
-          <div>
-            <p className="font-bold text-primary text-sm">Drop your RSSI CSV here</p>
-            <p className="text-xs text-slate-400 mt-1">Required columns: timestamp, mac_address, ap_id, ap_x, ap_y, rssi, area_name</p>
-          </div>
-        )}
-      </div>
-
-      <button onClick={handleUpload} disabled={!file || !selectedAreaId || isLoading}
-        className="w-full py-3 bg-secondary disabled:opacity-40 hover:opacity-90 text-white font-bold text-sm rounded-full shadow-lg transition-all">
-        {isLoading ? 'Processing...' : 'Upload & Process'}
-      </button>
-
-      {/* Terminal log */}
-      {logs.length > 0 && (
-        <div className="bg-primary rounded-2xl p-4 font-mono text-xs space-y-1 max-h-40 overflow-y-auto">
-          {logs.map((l, i) => (
-            <div key={i} className={`flex gap-2 ${l.type === 'error' ? 'text-red-400' : l.type === 'success' ? 'text-green-400' : 'text-slate-300'}`}>
-              <span className="text-slate-500">{l.time}</span>
-              <span>{l.text}</span>
+      {/* Readiness checklist */}
+      <div className="glass-card p-5 rounded-2xl border border-slate-100 space-y-3">
+        <h4 className="font-display font-bold text-primary">Ready to go live</h4>
+        <div className="space-y-2">
+          {[
+            ['Floor plan uploaded (DXF)', !!area?.dxf_parsed_data],
+            [`Access points detected (${apCount})`, apCount > 0],
+            [`Zones drawn (${zoneCount})`, zoneCount > 0],
+          ].map(([label, ok]) => (
+            <div key={label} className="flex items-center gap-2 text-sm">
+              <span className={`w-4 h-4 rounded-full flex items-center justify-center text-[10px] font-bold ${ok ? 'bg-green-100 text-green-700' : 'bg-slate-100 text-slate-400'}`}>
+                {ok ? '✓' : '•'}
+              </span>
+              <span className={ok ? 'text-on-surface' : 'text-slate-400'}>{label}</span>
             </div>
           ))}
         </div>
-      )}
+      </div>
 
-      {uploadedData && (
-        <div className="glass-card p-5 rounded-2xl border border-slate-100 space-y-3">
-          <h4 className="font-display font-bold text-primary">Upload Summary</h4>
-          <div className="grid grid-cols-2 gap-3">
-            <Stat label="Records Processed" value={uploadedData.records_processed} />
-            <Stat label="Devices Located" value={uploadedData.devices_located} />
-            <Stat label="Timestamps" value={uploadedData.timestamps} />
-            <Stat label="Zones Detected" value={uploadedData.zones_detected} />
-          </div>
-          <button onClick={onDone} className="w-full py-2.5 bg-secondary text-white font-bold text-sm rounded-full hover:opacity-90 transition-all">
-            View Occupancy →
-          </button>
+      {/* Live streaming explainer */}
+      <div className="glass-card p-5 rounded-2xl border border-green-200 bg-green-50 space-y-3">
+        <div className="flex items-center gap-2">
+          <span className="relative flex h-2.5 w-2.5">
+            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75" />
+            <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-green-500" />
+          </span>
+          <p className="font-sans font-bold text-green-800 text-sm">Occupancy streams in automatically</p>
         </div>
-      )}
+        <p className="text-xs text-green-700 leading-relaxed">
+          <strong>{areaName}</strong> now receives live RSSI data from your Wi-Fi controller
+          (or the simulator) at <code>/api/stream/ingest</code>. The floor plan updates every
+          30 seconds — no manual uploads needed.
+        </p>
+        <button onClick={onDone} disabled={!ready}
+          className="w-full py-2.5 bg-secondary disabled:opacity-40 text-white font-bold text-sm rounded-full hover:opacity-90 transition-all">
+          {ready ? 'View Live Floor Plan →' : 'Finish setup above to go live'}
+        </button>
+      </div>
     </div>
   );
 }
@@ -686,7 +636,7 @@ export default function AreaSetupView({ onViewChange }) {
         />
       )}
       {step === 2 && (
-        <Step3CSV
+        <Step3GoLive
           selectedAreaId={selectedAreaId}
           areas={areas}
           onDone={() => onViewChange?.('floor-plan')}

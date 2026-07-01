@@ -9,7 +9,6 @@ import DashboardView from './components/DashboardView';
 import FloorPlanView from './components/FloorPlanView';
 import AnalyticsView from './components/AnalyticsView';
 import BuildingsView from './components/BuildingsView';
-import DataImportView from './components/DataImportView';
 import AreaSetupView from './components/AreaSetupView';
 import SettingsView from './components/SettingsView';
 
@@ -39,7 +38,7 @@ function AppInner() {
   // Restore session from sessionStorage so a page refresh keeps the user signed in
   const [isSignedIn, setIsSignedIn] = useState(() => sessionStorage.getItem('fiq_signed_in') === 'true');
   const [userEmail, setUserEmail] = useState(() => sessionStorage.getItem('fiq_user_email') || '');
-  const { currentView, setCurrentView, loadBuildings, loadOrganisations, notification } = useApp();
+  const { currentView, setCurrentView, loadBuildings, loadOrganisations, showNotification } = useApp();
 
   // On a refresh where we were already signed in, re-bootstrap data from the API
   useEffect(() => {
@@ -50,26 +49,24 @@ function AppInner() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Settings state (local UI state only)
-  const [alertThreshold, setAlertThreshold] = useState(90);
-  const [alertsEnabled, setAlertsEnabled] = useState(true);
-  const [sensorOfflineWarning, setSensorOfflineWarning] = useState(true);
-  const [predictiveNotifications, setPredictiveNotifications] = useState(false);
-  const [operatingHoursStart, setOperatingHoursStart] = useState('08:00');
-  const [operatingHoursEnd, setOperatingHoursEnd] = useState('20:00');
-  const [maxLoadCapacity, setMaxLoadCapacity] = useState(1250);
-  const [intelligenceMode, setIntelligenceMode] = useState('Balanced Intelligence');
-  const [dataRetention, setDataRetention] = useState('90 Days (Enterprise)');
+  // Settings — UI preferences, persisted to localStorage so they survive refresh
+  const persisted = (() => {
+    try { return JSON.parse(localStorage.getItem('fiq_settings') || '{}'); }
+    catch { return {}; }
+  })();
+  const [alertThreshold, setAlertThreshold] = useState(persisted.alertThreshold ?? 90);
+  const [alertsEnabled, setAlertsEnabled] = useState(persisted.alertsEnabled ?? true);
+  const [sensorOfflineWarning, setSensorOfflineWarning] = useState(persisted.sensorOfflineWarning ?? true);
+  const [predictiveNotifications, setPredictiveNotifications] = useState(persisted.predictiveNotifications ?? false);
+  const [operatingHoursStart, setOperatingHoursStart] = useState(persisted.operatingHoursStart ?? '08:00');
+  const [operatingHoursEnd, setOperatingHoursEnd] = useState(persisted.operatingHoursEnd ?? '20:00');
+  const [maxLoadCapacity, setMaxLoadCapacity] = useState(persisted.maxLoadCapacity ?? 1250);
 
-  // Logs state
-  const [logs, setLogs] = useState([
-    { time: '14:40:02', type: 'info', text: 'FacilityIQ Core Sync boot sequence complete.' },
-    { time: '14:40:15', type: 'success', text: 'Connected to Supabase database.' },
-  ]);
-
-  const handleAddLog = (text, type = 'info') => {
-    const time = new Date().toLocaleTimeString('en-US', { hour12: false });
-    setLogs(prev => [{ time, type, text }, ...prev]);
+  const persistSettings = () => {
+    localStorage.setItem('fiq_settings', JSON.stringify({
+      alertThreshold, alertsEnabled, sensorOfflineWarning, predictiveNotifications,
+      operatingHoursStart, operatingHoursEnd, maxLoadCapacity,
+    }));
   };
 
   const handleLogin = async (email) => {
@@ -81,7 +78,6 @@ function AppInner() {
     // Bootstrap data
     await loadOrganisations();
     await loadBuildings();
-    handleAddLog(`User authenticated: ${email}`, 'success');
   };
 
   const handleLogout = () => {
@@ -104,7 +100,7 @@ function AppInner() {
           currentView={currentView}
           onViewChange={setCurrentView}
           onLogout={handleLogout}
-          activeBuildingName="FacilityIQ"
+          userEmail={userEmail}
         />
         <main className="flex-1 overflow-y-auto">
           {currentView === 'dashboard' && (
@@ -114,9 +110,6 @@ function AppInner() {
           {currentView === 'analytics' && <AnalyticsView />}
           {currentView === 'buildings' && (
             <div className="p-6"><BuildingsView /></div>
-          )}
-          {currentView === 'data-import' && (
-            <DataImportView logs={logs} onAddLog={handleAddLog} />
           )}
           {currentView === 'area-setup' && <AreaSetupView onViewChange={setCurrentView} />}
           {currentView === 'settings' && (
@@ -129,9 +122,8 @@ function AppInner() {
                 operatingHoursStart={operatingHoursStart} setOperatingHoursStart={setOperatingHoursStart}
                 operatingHoursEnd={operatingHoursEnd} setOperatingHoursEnd={setOperatingHoursEnd}
                 maxLoadCapacity={maxLoadCapacity} setMaxLoadCapacity={setMaxLoadCapacity}
-                intelligenceMode={intelligenceMode} setIntelligenceMode={setIntelligenceMode}
-                dataRetention={dataRetention} setDataRetention={setDataRetention}
-                onSave={() => handleAddLog('Settings saved.', 'success')}
+                userEmail={userEmail}
+                onSave={() => { persistSettings(); showNotification('success', 'Settings saved.'); }}
               />
             </div>
           )}

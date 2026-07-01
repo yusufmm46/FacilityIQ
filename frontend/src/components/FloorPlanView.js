@@ -1,48 +1,24 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { ZoomIn, ZoomOut, Compass } from 'lucide-react';
 import { useApp } from '../context/AppContext';
 
 // 4 thresholds: 0-25% grey, 25-50% teal, 50-75% amber, 75-100% red
 function getZoneConfig(pct) {
   if (pct >= 75) return {
-    status: 'CRITICAL',
-    fill: 'rgba(220,38,38,0.40)',
-    fillSelected: 'rgba(220,38,38,0.65)',
-    stroke: '#dc2626',
-    badge: 'bg-red-100 text-red-700',
-    bar: 'border-red-500',
-    barColor: '#dc2626',
-    label: '75–100%',
+    status: 'CRITICAL', fill: 'rgba(220,38,38,0.40)', fillSelected: 'rgba(220,38,38,0.65)',
+    stroke: '#dc2626', badge: 'bg-red-100 text-red-700', bar: 'border-red-500', barColor: '#dc2626',
   };
   if (pct >= 50) return {
-    status: 'BUSY',
-    fill: 'rgba(217,119,6,0.35)',
-    fillSelected: 'rgba(217,119,6,0.60)',
-    stroke: '#d97706',
-    badge: 'bg-amber-100 text-amber-700',
-    bar: 'border-amber-500',
-    barColor: '#d97706',
-    label: '50–75%',
+    status: 'BUSY', fill: 'rgba(217,119,6,0.35)', fillSelected: 'rgba(217,119,6,0.60)',
+    stroke: '#d97706', badge: 'bg-amber-100 text-amber-700', bar: 'border-amber-500', barColor: '#d97706',
   };
   if (pct >= 25) return {
-    status: 'MODERATE',
-    fill: 'rgba(13,148,136,0.28)',
-    fillSelected: 'rgba(13,148,136,0.55)',
-    stroke: '#006a61',
-    badge: 'bg-teal-100 text-teal-700',
-    bar: 'border-teal-500',
-    barColor: '#006a61',
-    label: '25–50%',
+    status: 'MODERATE', fill: 'rgba(13,148,136,0.28)', fillSelected: 'rgba(13,148,136,0.55)',
+    stroke: '#006a61', badge: 'bg-teal-100 text-teal-700', bar: 'border-teal-500', barColor: '#006a61',
   };
   return {
-    status: 'QUIET',
-    fill: 'rgba(100,116,139,0.15)',
-    fillSelected: 'rgba(100,116,139,0.35)',
-    stroke: '#64748b',
-    badge: 'bg-slate-100 text-slate-600',
-    bar: 'border-slate-400',
-    barColor: '#64748b',
-    label: '0–25%',
+    status: 'QUIET', fill: 'rgba(100,116,139,0.15)', fillSelected: 'rgba(100,116,139,0.35)',
+    stroke: '#64748b', badge: 'bg-slate-100 text-slate-600', bar: 'border-slate-400', barColor: '#64748b',
   };
 }
 
@@ -68,64 +44,31 @@ function getPolygonCentroid(poly, vw, vh, width_m, height_m) {
   ];
 }
 
-// Generate flow arrows between zone centroids based on occupancy order
-function buildFlowArrows(zones, occupancyByZone, width_m, height_m, vw, vh) {
-  const ranked = zones
-    .map(z => {
-      const occ = occupancyByZone[z.id];
-      const pct = occ?.occupancy_pct || 0;
-      const [cx, cy] = getPolygonCentroid(z.polygon_json, vw, vh, width_m, height_m);
-      return { id: z.id, name: z.name, pct, cx, cy };
-    })
-    .sort((a, b) => b.pct - a.pct);
-
-  const arrows = [];
-  for (let i = 0; i < ranked.length - 1; i++) {
-    const from = ranked[i];
-    const to = ranked[i + 1];
-    const dx = to.cx - from.cx;
-    const dy = to.cy - from.cy;
-    const len = Math.sqrt(dx * dx + dy * dy) || 1;
-    // Shorten arrow so it doesn't overlap zone labels
-    const pad = 30;
-    const x1 = from.cx + (dx / len) * pad;
-    const y1 = from.cy + (dy / len) * pad;
-    const x2 = to.cx - (dx / len) * pad;
-    const y2 = to.cy - (dy / len) * pad;
-    arrows.push({ x1, y1, x2, y2, fromPct: from.pct, toPct: to.pct, key: `${from.id}-${to.id}` });
-  }
-  return arrows;
-}
-
 const LIVE_POLL_MS = 30000;  // poll live stream every 30s
+const MIN_ZOOM = 0.4, MAX_ZOOM = 6;
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 
 export default function FloorPlanView() {
   const {
     selectedArea, dxfData, zones, accessPoints,
-    occupancyData, deviceData, timestamps, selectedTimestamp,
-    setSelectedTimestamp, isLoading, liveData, loadLive,
+    liveData, loadLive,
   } = useApp();
 
-  const [activeTab, setActiveTab] = useState('heatmap');
   const [selectedZoneId, setSelectedZoneId] = useState(null);
   const [statusFilter, setStatusFilter] = useState('All');
   const [tooltip, setTooltip] = useState(null);
-  const [zoom, setZoom] = useState(1);
   const [tick, setTick] = useState(0);  // re-render every second for "Xs ago"
 
-  // Auto-poll the live stream for the selected area every 30s
-  useEffect(() => {
-    if (!selectedArea?.name) return;
-    loadLive(selectedArea.name);
-    const id = setInterval(() => loadLive(selectedArea.name), LIVE_POLL_MS);
-    return () => clearInterval(id);
-  }, [selectedArea?.name, loadLive]);
-
-  // 1-second ticker so the "last updated" label counts up
-  useEffect(() => {
-    const id = setInterval(() => setTick(t => t + 1), 1000);
-    return () => clearInterval(id);
-  }, []);
+  // ── Pan & zoom state ────────────────────────────────────────────
+  const [zoom, setZoom] = useState(1);
+  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const [isDragging, setIsDragging] = useState(false);
+  const svgRef = useRef(null);
+  const zoomRef = useRef(1);
+  const panRef = useRef({ x: 0, y: 0 });
+  const dragRef = useRef({ active: false, start: null, startPan: null });
+  zoomRef.current = zoom;
+  panRef.current = pan;
 
   const vw = 1000, vh = 600;
   const fb = dxfData?.floor_boundary;
@@ -133,12 +76,79 @@ export default function FloorPlanView() {
   const width_m = fb?.width_m || selectedArea?.width_m || 100;
   const height_m = fb?.height_m || selectedArea?.height_m || 60;
 
-  // Prefer LIVE stream data; fall back to CSV-based occupancy/devices.
-  const liveForArea = liveData && liveData.area_name === selectedArea?.name ? liveData : null;
-  const zoneSource = liveForArea ? liveForArea.zones : (occupancyData?.zones || []);
-  const allDevices = liveForArea ? liveForArea.devices : (deviceData?.devices || []);
+  // Convert a screen point to SVG viewBox coordinates
+  const clientToSvg = useCallback((clientX, clientY) => {
+    const svg = svgRef.current;
+    if (!svg || !svg.getScreenCTM) return { x: 0, y: 0 };
+    const pt = svg.createSVGPoint();
+    pt.x = clientX; pt.y = clientY;
+    const ctm = svg.getScreenCTM();
+    if (!ctm) return { x: 0, y: 0 };
+    const p = pt.matrixTransform(ctm.inverse());
+    return { x: p.x, y: p.y };
+  }, []);
 
-  // Record when each live payload arrived, so "Xs ago" can tick up locally.
+  // Zoom keeping a given SVG point fixed under the cursor
+  const zoomAround = useCallback((cx, cy, factor) => {
+    const z0 = zoomRef.current;
+    const z1 = clamp(z0 * factor, MIN_ZOOM, MAX_ZOOM);
+    if (z1 === z0) return;
+    const p0 = panRef.current;
+    setPan({ x: cx - (z1 / z0) * (cx - p0.x), y: cy - (z1 / z0) * (cy - p0.y) });
+    setZoom(z1);
+  }, []);
+
+  // Native wheel listener (non-passive so we can preventDefault page scroll)
+  useEffect(() => {
+    const svg = svgRef.current;
+    if (!svg) return;
+    const onWheel = (e) => {
+      e.preventDefault();
+      const factor = e.deltaY < 0 ? 1.12 : 1 / 1.12;
+      const c = clientToSvg(e.clientX, e.clientY);
+      zoomAround(c.x, c.y, factor);
+    };
+    svg.addEventListener('wheel', onWheel, { passive: false });
+    return () => svg.removeEventListener('wheel', onWheel);
+  }, [fb, clientToSvg, zoomAround]);
+
+  // Drag-to-pan handlers
+  const onMouseDown = (e) => {
+    if (e.button !== 0) return;            // left button only
+    const s = clientToSvg(e.clientX, e.clientY);
+    dragRef.current = { active: true, start: s, startPan: panRef.current };
+    setIsDragging(true);
+  };
+  const onMouseMove = (e) => {
+    if (!dragRef.current.active) return;
+    const cur = clientToSvg(e.clientX, e.clientY);
+    const { start, startPan } = dragRef.current;
+    setPan({ x: startPan.x + (cur.x - start.x), y: startPan.y + (cur.y - start.y) });
+  };
+  const endDrag = () => {
+    if (dragRef.current.active) { dragRef.current.active = false; setIsDragging(false); }
+  };
+
+  const resetView = () => { setZoom(1); setPan({ x: 0, y: 0 }); };
+
+  // ── Live polling ────────────────────────────────────────────────
+  useEffect(() => {
+    if (!selectedArea?.name) return;
+    loadLive(selectedArea.name);
+    const id = setInterval(() => loadLive(selectedArea.name), LIVE_POLL_MS);
+    return () => clearInterval(id);
+  }, [selectedArea?.name, loadLive]);
+
+  useEffect(() => {
+    const id = setInterval(() => setTick(t => t + 1), 1000);
+    return () => clearInterval(id);
+  }, []);
+
+  // Live stream data for the selected area
+  const liveForArea = liveData && liveData.area_name === selectedArea?.name ? liveData : null;
+  const zoneSource = liveForArea ? liveForArea.zones : [];
+  const allDevices = liveForArea ? liveForArea.devices : [];
+
   const liveRecvRef = useRef({ key: null, at: 0, base: null });
   const liveKey = liveForArea ? `${liveForArea.area_name}|${liveForArea.last_updated}` : null;
   if (liveKey && liveRecvRef.current.key !== liveKey) {
@@ -148,11 +158,9 @@ export default function FloorPlanView() {
   const secondsAgo = hasLivePayload
     ? liveRecvRef.current.base + Math.floor((Date.now() - liveRecvRef.current.at) / 1000)
     : null;
-  // "live" if data refreshed within the last 60s (recomputed client-side via tick)
   const isLive = secondsAgo !== null && secondsAgo <= 60;
-  void tick;  // tick drives the re-render that recomputes secondsAgo
+  void tick;
 
-  // Build occupancy lookup by zone id
   const occupancyByZone = {};
   (zoneSource || []).forEach(z => { occupancyByZone[z.zone_id] = z; });
 
@@ -162,10 +170,6 @@ export default function FloorPlanView() {
     const pct = occ?.occupancy_pct || 0;
     return getZoneConfig(pct).status === statusFilter.toUpperCase();
   });
-
-  const flowArrows = activeTab === 'flow'
-    ? buildFlowArrows(zones, occupancyByZone, width_m, height_m, vw, vh)
-    : [];
 
   return (
     <div className="flex-1 flex flex-col relative h-[calc(100vh-80px)] overflow-hidden font-sans">
@@ -198,36 +202,12 @@ export default function FloorPlanView() {
             </div>
           )}
 
-          <div className="flex items-center bg-slate-100 p-1 rounded-xl shadow-inner border border-slate-100">
-            {[
-              { id: 'heatmap', label: 'Heatmap' },
-              { id: 'devices', label: 'Devices' },
-              { id: 'flow',    label: 'Flow' },
-            ].map(tab => (
-              <button key={tab.id} onClick={() => setActiveTab(tab.id)}
-                className={`px-4 py-1.5 rounded-lg text-xs font-bold uppercase tracking-wider font-mono transition-all ${
-                  activeTab === tab.id ? 'bg-secondary text-white shadow-sm' : 'text-on-surface-variant hover:text-secondary'
-                }`}>
-                {tab.label}
-              </button>
-            ))}
-          </div>
-
-          {/* Mode description pill */}
           <span className="hidden sm:block text-[10px] font-mono text-slate-400 font-medium">
-            {activeTab === 'heatmap' && 'Zone density by occupancy %'}
-            {activeTab === 'devices' && 'Individual device positions'}
-            {activeTab === 'flow'    && 'Traffic flow between zones'}
+            Live heatmap · scroll to zoom · drag to pan
           </span>
         </div>
 
         <div className="flex items-center gap-3">
-          {timestamps.length > 0 && (
-            <select value={selectedTimestamp || ''} onChange={e => setSelectedTimestamp(e.target.value)}
-              className="bg-white border border-slate-200 focus:border-secondary rounded-xl text-xs font-mono font-bold py-2 pl-4 pr-8 shadow-sm cursor-pointer outline-none">
-              {timestamps.map(ts => <option key={ts} value={ts}>{ts}</option>)}
-            </select>
-          )}
           <select value={statusFilter} onChange={e => setStatusFilter(e.target.value)}
             className="bg-white border border-slate-200 focus:border-secondary rounded-xl text-xs font-mono font-bold py-2 pl-4 pr-8 shadow-sm cursor-pointer outline-none">
             {['All', 'Quiet', 'Moderate', 'Busy', 'Critical'].map(s => <option key={s}>{s}</option>)}
@@ -247,267 +227,128 @@ export default function FloorPlanView() {
             </div>
           ) : (
             <svg
+              ref={svgRef}
               viewBox={`0 0 ${vw} ${vh}`}
               className="w-full h-full drop-shadow-2xl max-w-4xl max-h-[500px]"
-              style={{ transform: `scale(${zoom})`, transformOrigin: 'center' }}
+              style={{ cursor: isDragging ? 'grabbing' : 'grab' }}
+              onMouseDown={onMouseDown}
+              onMouseMove={onMouseMove}
+              onMouseUp={endDrag}
+              onMouseLeave={endDrag}
             >
-              {/* ── Layer 1: Floor boundary ── */}
-              <path d={fb.svg_path} fill="rgba(248,250,252,0.9)" stroke="#c5c6ce" strokeWidth="2" />
+              <g transform={`translate(${pan.x} ${pan.y}) scale(${zoom})`}>
+                {/* ── Layer 1: Floor boundary ── */}
+                <path d={fb.svg_path} fill="rgba(248,250,252,0.9)" stroke="#c5c6ce" strokeWidth="2" />
 
-              {/* ── Layer 2: CAD geometry — walls solid, furniture lighter ── */}
-              {polylines.map(p => {
-                const cat = p.category || 'detail';
-                const style = cat === 'structural'
-                  ? { stroke: '#94a3b8', strokeWidth: 1.8, opacity: 1 }      // walls — darker
-                  : cat === 'furniture'
-                  ? { stroke: '#cbd5e1', strokeWidth: 1, opacity: 0.85 }     // furniture — light
-                  : { stroke: '#dde3ec', strokeWidth: 0.8, opacity: 0.7 };   // detail — faint
-                return (
-                  <path
-                    key={p.id}
-                    d={p.svg_path}
-                    fill="none"
-                    stroke={style.stroke}
-                    strokeWidth={style.strokeWidth}
-                    opacity={style.opacity}
-                  />
-                );
-              })}
+                {/* ── Layer 2: CAD geometry — walls solid, furniture lighter ── */}
+                {polylines.map(p => {
+                  const cat = p.category || 'detail';
+                  const style = cat === 'structural'
+                    ? { stroke: '#94a3b8', strokeWidth: 1.8, opacity: 1 }
+                    : cat === 'furniture'
+                    ? { stroke: '#cbd5e1', strokeWidth: 1, opacity: 0.85 }
+                    : { stroke: '#dde3ec', strokeWidth: 0.8, opacity: 0.7 };
+                  return (
+                    <path key={p.id} d={p.svg_path} fill="none"
+                      stroke={style.stroke} strokeWidth={style.strokeWidth} opacity={style.opacity} />
+                  );
+                })}
 
-              {/* ══════════════════════════════════════════
-                  HEATMAP MODE — zone color fills only,
-                  no device dots. Color = occupancy tier.
-              ══════════════════════════════════════════ */}
-              {activeTab === 'heatmap' && filteredZones.map(z => {
-                const occ = occupancyByZone[z.id];
-                const pct = occ?.occupancy_pct || 0;
-                const cfg = getZoneConfig(pct);
-                const poly = z.polygon_json;
-                if (!poly || poly.length < 3) return null;
-                const d = ptsToPath(poly, vw, vh, width_m, height_m);
-                const [cx, cy] = getPolygonCentroid(poly, vw, vh, width_m, height_m);
-                const isSelected = selectedZoneId === z.id;
-                return (
-                  <g key={z.id} onClick={() => setSelectedZoneId(z.id === selectedZoneId ? null : z.id)} className="cursor-pointer">
-                    <path
-                      d={d}
-                      fill={isSelected ? cfg.fillSelected : cfg.fill}
-                      stroke={cfg.stroke}
-                      strokeWidth={isSelected ? 2.5 : 1.5}
-                      className="transition-all hover:opacity-90"
-                    />
-                    <text x={cx} y={cy - 10} fontSize="11" fill={cfg.stroke} fontWeight="bold" textAnchor="middle" pointerEvents="none">
-                      {z.name}
-                    </text>
-                    <text x={cx} y={cy + 6} fontSize="13" fill={cfg.stroke} fontWeight="bold" textAnchor="middle" pointerEvents="none">
-                      {pct.toFixed(0)}%
-                    </text>
-                    {occ && (
-                      <text x={cx} y={cy + 20} fontSize="10" fill={cfg.stroke} textAnchor="middle" pointerEvents="none" opacity="0.85">
-                        {occ.devices}p / {z.capacity}
-                      </text>
-                    )}
+                {/* ── Layer 3: Zone heatmap fills + labels ── */}
+                {filteredZones.map(z => {
+                  const occ = occupancyByZone[z.id];
+                  const pct = occ?.occupancy_pct || 0;
+                  const cfg = getZoneConfig(pct);
+                  const poly = z.polygon_json;
+                  if (!poly || poly.length < 3) return null;
+                  const d = ptsToPath(poly, vw, vh, width_m, height_m);
+                  const [cx, cy] = getPolygonCentroid(poly, vw, vh, width_m, height_m);
+                  const isSelected = selectedZoneId === z.id;
+                  return (
+                    <g key={z.id} onClick={() => setSelectedZoneId(z.id === selectedZoneId ? null : z.id)} className="cursor-pointer">
+                      <path d={d} fill={isSelected ? cfg.fillSelected : cfg.fill}
+                        stroke={cfg.stroke} strokeWidth={isSelected ? 2.5 : 1.5}
+                        className="transition-all hover:opacity-90" />
+                      <text x={cx} y={cy - 10} fontSize="11" fill={cfg.stroke} fontWeight="bold" textAnchor="middle" pointerEvents="none">{z.name}</text>
+                      <text x={cx} y={cy + 6} fontSize="13" fill={cfg.stroke} fontWeight="bold" textAnchor="middle" pointerEvents="none">{pct.toFixed(0)}%</text>
+                      {occ && (
+                        <text x={cx} y={cy + 20} fontSize="10" fill={cfg.stroke} textAnchor="middle" pointerEvents="none" opacity="0.85">
+                          {occ.devices}p / {z.capacity}
+                        </text>
+                      )}
+                    </g>
+                  );
+                })}
+
+                {/* ── Layer 4: Live device positions (glide on each update) ── */}
+                {allDevices.map((d, i) => (
+                  <g key={i}
+                    onMouseEnter={() => setTooltip({ x: d.x_svg, y: d.y_svg, text: d.zone_name || 'In transit' })}
+                    onMouseLeave={() => setTooltip(null)}
+                    className="cursor-crosshair"
+                  >
+                    <circle cx={d.x_svg} cy={d.y_svg} r="7" fill="rgba(29,78,216,0.18)" style={{ transition: 'cx 0.9s ease, cy 0.9s ease' }} />
+                    <circle cx={d.x_svg} cy={d.y_svg} r="3.5" fill="#1d4ed8" stroke="#ffffff" strokeWidth="0.8" style={{ transition: 'cx 0.9s ease, cy 0.9s ease' }} />
                   </g>
-                );
-              })}
+                ))}
 
-              {/* ══════════════════════════════════════════
-                  DEVICES MODE — individual dots only,
-                  zone borders shown as outlines (no fill).
-                  Dot color = zone occupancy tier.
-              ══════════════════════════════════════════ */}
-              {activeTab === 'devices' && (
-                <>
-                  {/* Zone outlines only — no fill */}
-                  {filteredZones.map(z => {
-                    const poly = z.polygon_json;
-                    if (!poly || poly.length < 3) return null;
-                    const d = ptsToPath(poly, vw, vh, width_m, height_m);
-                    const occ = occupancyByZone[z.id];
-                    const pct = occ?.occupancy_pct || 0;
-                    const cfg = getZoneConfig(pct);
-                    const [cx, cy] = getPolygonCentroid(poly, vw, vh, width_m, height_m);
-                    return (
-                      <g key={z.id}>
-                        <path d={d} fill="none" stroke={cfg.stroke} strokeWidth="1.5" strokeDasharray="5,4" opacity="0.6" />
-                        <text x={cx} y={cy} fontSize="10" fill={cfg.stroke} textAnchor="middle" pointerEvents="none" opacity="0.7" fontWeight="bold">
-                          {z.name}
-                        </text>
-                      </g>
-                    );
-                  })}
+                {/* ── Layer 5: AP markers ── */}
+                {accessPoints.map(ap => {
+                  const [sx, sy] = metersToSvg(ap.x_m, ap.y_m, width_m, height_m, vw, vh);
+                  return (
+                    <g key={ap.ap_id} transform={`translate(${sx},${sy})`}>
+                      <circle cx="0" cy="0" r="14" fill="rgba(0,106,97,0.12)" />
+                      <circle cx="0" cy="0" r="5" fill="#006a61" />
+                      <text x="0" y="-16" fontSize="9" fill="#006a61" fontWeight="bold" textAnchor="middle">{ap.ap_id}</text>
+                    </g>
+                  );
+                })}
 
-                  {/* Device dots — color-coded by their zone's occupancy tier */}
-                  {allDevices.map((d, i) => {
-                    const occ = d.zone_id ? occupancyByZone[d.zone_id] : null;
-                    const pct = occ?.occupancy_pct || 0;
-                    const cfg = getZoneConfig(pct);
-                    return (
-                      <g key={i}
-                        onMouseEnter={() => setTooltip({ x: d.x_svg, y: d.y_svg, text: d.zone_name || 'Outside zones', pct })}
-                        onMouseLeave={() => setTooltip(null)}
-                        className="cursor-crosshair"
-                      >
-                        {/* Glow ring */}
-                        <circle cx={d.x_svg} cy={d.y_svg} r="9" fill={cfg.fill} />
-                        {/* Core dot */}
-                        <circle cx={d.x_svg} cy={d.y_svg} r="4.5" fill={cfg.stroke} opacity="0.9" />
-                      </g>
-                    );
-                  })}
-                </>
-              )}
-
-              {/* ══════════════════════════════════════════
-                  FLOW MODE — arrows from busiest to
-                  quietest zone, thickness = device count.
-                  Zone fills shown at lower opacity.
-              ══════════════════════════════════════════ */}
-              {activeTab === 'flow' && (
-                <>
-                  {/* Faint zone fills for spatial context */}
-                  {filteredZones.map(z => {
-                    const poly = z.polygon_json;
-                    if (!poly || poly.length < 3) return null;
-                    const d = ptsToPath(poly, vw, vh, width_m, height_m);
-                    const occ = occupancyByZone[z.id];
-                    const pct = occ?.occupancy_pct || 0;
-                    const cfg = getZoneConfig(pct);
-                    const [cx, cy] = getPolygonCentroid(poly, vw, vh, width_m, height_m);
-                    return (
-                      <g key={z.id}>
-                        <path d={d} fill={cfg.fill} stroke={cfg.stroke} strokeWidth="1" opacity="0.5" />
-                        <text x={cx} y={cy - 6} fontSize="10" fill={cfg.stroke} textAnchor="middle" pointerEvents="none" fontWeight="bold">
-                          {z.name}
-                        </text>
-                        <text x={cx} y={cy + 8} fontSize="11" fill={cfg.stroke} textAnchor="middle" pointerEvents="none" fontWeight="bold">
-                          {pct.toFixed(0)}%
-                        </text>
-                      </g>
-                    );
-                  })}
-
-                  {/* Flow arrows: busiest → next busiest → ... quietest */}
-                  <defs>
-                    <marker id="arrow-teal" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
-                      <path d="M0,0 L0,6 L8,3 z" fill="#0d9488" />
-                    </marker>
-                    <marker id="arrow-amber" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
-                      <path d="M0,0 L0,6 L8,3 z" fill="#d97706" />
-                    </marker>
-                    <marker id="arrow-red" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
-                      <path d="M0,0 L0,6 L8,3 z" fill="#dc2626" />
-                    </marker>
-                    <marker id="arrow-slate" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
-                      <path d="M0,0 L0,6 L8,3 z" fill="#64748b" />
-                    </marker>
-                  </defs>
-                  {flowArrows.map(a => {
-                    const cfg = getZoneConfig(a.fromPct);
-                    const markerId = cfg.status === 'CRITICAL' ? 'arrow-red'
-                      : cfg.status === 'BUSY' ? 'arrow-amber'
-                      : cfg.status === 'MODERATE' ? 'arrow-teal' : 'arrow-slate';
-                    // Thickness proportional to from-zone occupancy
-                    const strokeWidth = Math.max(1.5, (a.fromPct / 100) * 6);
-                    return (
-                      <line
-                        key={a.key}
-                        x1={a.x1} y1={a.y1} x2={a.x2} y2={a.y2}
-                        stroke={cfg.stroke}
-                        strokeWidth={strokeWidth}
-                        markerEnd={`url(#${markerId})`}
-                        opacity="0.75"
-                        strokeLinecap="round"
-                      />
-                    );
-                  })}
-
-                  {flowArrows.length === 0 && zones.length < 2 && (
-                    <text x={vw / 2} y={vh / 2} fontSize="13" fill="#94a3b8" textAnchor="middle">
-                      Need 2+ zones to show flow
+                {/* Tooltip */}
+                {tooltip && (
+                  <g pointerEvents="none">
+                    <rect x={tooltip.x + 10} y={tooltip.y - 22} width="110" height="22" rx="5" fill="rgba(0,7,27,0.88)" />
+                    <text x={tooltip.x + 65} y={tooltip.y - 7} fontSize="10" fill="white" textAnchor="middle" fontWeight="bold">
+                      {tooltip.text}
                     </text>
-                  )}
-                </>
-              )}
-
-              {/* ── AP Markers (always visible) ── */}
-              {accessPoints.map(ap => {
-                const [sx, sy] = metersToSvg(ap.x_m, ap.y_m, width_m, height_m, vw, vh);
-                return (
-                  <g key={ap.ap_id} transform={`translate(${sx},${sy})`}>
-                    <circle cx="0" cy="0" r="14" fill="rgba(0,106,97,0.12)" />
-                    <circle cx="0" cy="0" r="5" fill="#006a61" />
-                    <text x="0" y="-16" fontSize="9" fill="#006a61" fontWeight="bold" textAnchor="middle">{ap.ap_id}</text>
                   </g>
-                );
-              })}
-
-              {/* Tooltip */}
-              {tooltip && (
-                <g>
-                  <rect x={tooltip.x + 10} y={tooltip.y - 22} width="120" height="22" rx="5" fill="rgba(0,7,27,0.88)" />
-                  <text x={tooltip.x + 70} y={tooltip.y - 7} fontSize="10" fill="white" textAnchor="middle" fontWeight="bold">
-                    {tooltip.text} · {tooltip.pct?.toFixed(0)}%
-                  </text>
-                </g>
-              )}
+                )}
+              </g>
             </svg>
           )}
 
-          {/* Zoom controls */}
+          {/* Zoom controls (mouse scroll/drag also work) */}
           <div className="absolute bottom-6 left-6 flex flex-col gap-2">
-            <button onClick={() => setZoom(z => Math.min(z + 0.15, 2.5))} className="w-12 h-12 bg-white rounded-xl shadow-lg border border-slate-200 flex items-center justify-center hover:bg-slate-50 active:scale-95 transition-all text-primary">
+            <button onClick={() => zoomAround(vw / 2, vh / 2, 1.2)} className="w-12 h-12 bg-white rounded-xl shadow-lg border border-slate-200 flex items-center justify-center hover:bg-slate-50 active:scale-95 transition-all text-primary">
               <ZoomIn className="w-5 h-5" />
             </button>
-            <button onClick={() => setZoom(z => Math.max(z - 0.15, 0.4))} className="w-12 h-12 bg-white rounded-xl shadow-lg border border-slate-200 flex items-center justify-center hover:bg-slate-50 active:scale-95 transition-all text-primary">
+            <button onClick={() => zoomAround(vw / 2, vh / 2, 1 / 1.2)} className="w-12 h-12 bg-white rounded-xl shadow-lg border border-slate-200 flex items-center justify-center hover:bg-slate-50 active:scale-95 transition-all text-primary">
               <ZoomOut className="w-5 h-5" />
             </button>
-            <button onClick={() => setZoom(1)} className="w-12 h-12 bg-white rounded-xl shadow-lg border border-slate-200 flex items-center justify-center hover:bg-slate-50 active:scale-95 transition-all text-primary mt-2">
+            <button onClick={resetView} title="Reset view" className="w-12 h-12 bg-white rounded-xl shadow-lg border border-slate-200 flex items-center justify-center hover:bg-slate-50 active:scale-95 transition-all text-primary mt-2">
               <Compass className="w-5 h-5" />
             </button>
           </div>
 
-          {/* Color legend — changes per mode */}
+          {/* Occupancy legend */}
           <div className="absolute bottom-6 right-6 bg-white/90 backdrop-blur border border-slate-100 rounded-xl p-3 shadow-sm text-[10px] font-mono space-y-1.5">
-            {activeTab === 'heatmap' && (
-              <>
-                <p className="text-slate-400 font-bold uppercase tracking-wider mb-2">Occupancy</p>
-                {[
-                  ['rgba(220,38,38,0.40)', '#dc2626', '75–100%', 'Critical'],
-                  ['rgba(217,119,6,0.35)',  '#d97706', '50–75%',  'Busy'],
-                  ['rgba(13,148,136,0.28)', '#006a61', '25–50%',  'Moderate'],
-                  ['rgba(100,116,139,0.15)','#64748b', '0–25%',   'Quiet'],
-                ].map(([bg, border, pct, label]) => (
-                  <div key={label} className="flex items-center gap-2">
-                    <div className="w-4 h-4 rounded" style={{ background: bg, border: `1.5px solid ${border}` }} />
-                    <span className="text-slate-600 font-semibold">{pct}</span>
-                    <span className="text-slate-400">{label}</span>
-                  </div>
-                ))}
-              </>
-            )}
-            {activeTab === 'devices' && (
-              <>
-                <p className="text-slate-400 font-bold uppercase tracking-wider mb-2">Device Tier</p>
-                {[
-                  ['#dc2626', 'Critical zone (75%+)'],
-                  ['#d97706', 'Busy zone (50–75%)'],
-                  ['#006a61', 'Moderate zone (25–50%)'],
-                  ['#64748b', 'Quiet zone (0–25%)'],
-                ].map(([c, l]) => (
-                  <div key={l} className="flex items-center gap-2">
-                    <div className="w-3 h-3 rounded-full" style={{ background: c }} />
-                    <span className="text-slate-600">{l}</span>
-                  </div>
-                ))}
-              </>
-            )}
-            {activeTab === 'flow' && (
-              <>
-                <p className="text-slate-400 font-bold uppercase tracking-wider mb-2">Flow Direction</p>
-                <p className="text-slate-500 leading-relaxed max-w-[140px]">Arrows show movement from busiest → quietest zones. Thickness = occupancy level.</p>
-              </>
-            )}
+            <p className="text-slate-400 font-bold uppercase tracking-wider mb-2">Occupancy</p>
+            {[
+              ['rgba(220,38,38,0.40)', '#dc2626', '75–100%', 'Critical'],
+              ['rgba(217,119,6,0.35)',  '#d97706', '50–75%',  'Busy'],
+              ['rgba(13,148,136,0.28)', '#006a61', '25–50%',  'Moderate'],
+              ['rgba(100,116,139,0.15)','#64748b', '0–25%',   'Quiet'],
+            ].map(([bg, border, pct, label]) => (
+              <div key={label} className="flex items-center gap-2">
+                <div className="w-4 h-4 rounded" style={{ background: bg, border: `1.5px solid ${border}` }} />
+                <span className="text-slate-600 font-semibold">{pct}</span>
+                <span className="text-slate-400">{label}</span>
+              </div>
+            ))}
+            <div className="flex items-center gap-2 pt-1.5 mt-1 border-t border-slate-100">
+              <span className="w-3 h-3 rounded-full bg-[#1d4ed8] border border-white shadow" />
+              <span className="text-slate-500">Live device</span>
+            </div>
           </div>
         </div>
 
@@ -515,8 +356,8 @@ export default function FloorPlanView() {
         <div className="h-full w-80 bg-white/95 backdrop-blur border-l border-slate-100 flex flex-col p-6 z-20 overflow-y-auto">
           <div className="flex items-center justify-between mb-6">
             <h3 className="text-base font-bold text-primary">Zone Status</h3>
-            <span className="text-[10px] font-mono bg-slate-100 text-slate-500 font-bold px-2 py-0.5 rounded">
-              {timestamps.length > 0 ? 'LIVE' : 'NO DATA'}
+            <span className={`text-[10px] font-mono font-bold px-2 py-0.5 rounded ${isLive ? 'bg-green-100 text-green-700' : 'bg-slate-100 text-slate-500'}`}>
+              {isLive ? 'LIVE' : 'NO DATA'}
             </span>
           </div>
 
@@ -560,8 +401,8 @@ export default function FloorPlanView() {
       <footer className="h-16 bg-white border-t border-slate-100 px-6 flex items-center justify-between z-30 shrink-0 select-none">
         <div className="flex items-center gap-8">
           {[
-            { label: 'Total Occupants', val: liveForArea ? liveForArea.total_devices : (occupancyData?.total_devices ?? allDevices.length) },
-            { label: 'Busiest Zone',    val: (liveForArea ? liveForArea.most_crowded : occupancyData?.most_crowded) || '—', colored: true },
+            { label: 'Total Occupants', val: liveForArea?.total_devices ?? 0 },
+            { label: 'Busiest Zone',    val: liveForArea?.most_crowded || '—', colored: true },
             { label: 'Active APs',      val: `${accessPoints.length}` },
           ].map(({ label, val, colored }) => (
             <div key={label} className="flex items-center gap-2">

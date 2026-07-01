@@ -301,7 +301,7 @@ export default function BuildingsView() {
               <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
               <p className="text-xs text-amber-800 font-medium leading-relaxed">
                 <strong>Important:</strong> This name must <strong>exactly</strong> match the{' '}
-                <code className="bg-amber-100 px-1 rounded">area_name</code> column in your CSV. It is case-sensitive.
+                <code className="bg-amber-100 px-1 rounded">area_name</code> your Wi-Fi controller sends. It is case-sensitive.
               </p>
             </div>
             <button type="submit" className="w-full py-3 bg-secondary hover:opacity-90 text-white font-bold text-xs rounded-full shadow-lg transition-all">Create Area</button>

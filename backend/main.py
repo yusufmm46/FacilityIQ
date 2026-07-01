@@ -5,7 +5,7 @@ import json
 import hashlib
 import tempfile
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional, List
 
 import numpy as np
@@ -14,16 +14,17 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from scipy.optimize import minimize
-from sqlalchemy import select, delete, text
+from sqlalchemy import select, delete, text, func
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 # Add backend to path so imports work
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from database import get_db, init_db
+from database import get_db, init_db, AsyncSessionLocal
 from models import (
     Organisation, Building, Floor, Area, AccessPoint,
-    Zone, RssiUpload, DevicePosition
+    Zone, RssiUpload, DevicePosition, ZoneHourlyStat
 )
 
 app = FastAPI(title="FacilityIQ API", version="2.0.0")
@@ -43,6 +44,13 @@ PATH_LOSS_N = 2.5
 @app.on_event("startup")
 async def startup():
     await init_db()
+    # Purge any history beyond the retention window on boot
+    try:
+        async with AsyncSessionLocal() as db:
+            await _purge_old_history(db, force=True)
+            await db.commit()
+    except Exception:
+        pass
 
 
 # ── HELPERS ──────────────────────────────────────────────────────
@@ -832,335 +840,6 @@ def _ap_dict(p):
             "x_m": p.x_m, "y_m": p.y_m, "layer": p.layer}
 
 
-# ── CSV UPLOAD ────────────────────────────────────────────────────
-@app.post("/api/upload")
-async def upload_csv(
-    file: UploadFile = File(...),
-    area_id: str = Form(...),
-    db: AsyncSession = Depends(get_db),
-):
-    result = await db.execute(select(Area).where(Area.id == area_id))
-    area = result.scalar_one_or_none()
-    if not area:
-        raise HTTPException(404, "Area not found")
-
-    contents = await file.read()
-    try:
-        df = pd.read_csv(io.StringIO(contents.decode("utf-8")))
-    except Exception as e:
-        raise HTTPException(400, f"CSV parse error: {e}")
-
-    required = ["timestamp", "mac_address", "ap_id", "ap_x", "ap_y", "rssi"]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise HTTPException(400, f"Missing columns: {missing}")
-
-    # Filter by area name if area_name column exists
-    if "area_name" in df.columns:
-        df_area = df[df["area_name"] == area.name]
-        if df_area.empty:
-            names = df["area_name"].unique().tolist()
-            raise HTTPException(400, (
-                f"No rows match area name '{area.name}'. "
-                f"Values in CSV: {names}. area_name is case-sensitive."
-            ))
-        df = df_area
-
-    floor_w = area.width_m or 100
-    floor_h = area.height_m or 60
-
-    # Get zones for this area
-    zones_result = await db.execute(select(Zone).where(Zone.area_id == area_id))
-    zones = zones_result.scalars().all()
-
-    def find_zone(x, y):
-        for z in zones:
-            poly = z.polygon_json
-            if poly and point_in_polygon(x, y, poly):
-                return z.id
-        return None
-
-    # Run triangulation
-    located = []
-    for (ts, mac), grp in df.groupby(["timestamp", "mac_address"]):
-        ap_pos = list(zip(grp["ap_x"].astype(float), grp["ap_y"].astype(float)))
-        distances = [rssi_to_distance(float(r)) for r in grp["rssi"]]
-        est_x, est_y = trilaterate(ap_pos, distances, floor_w, floor_h)
-        area_name = grp["area_name"].iloc[0] if "area_name" in grp.columns else area.name
-        zone_id = find_zone(est_x, est_y)
-        located.append({
-            "mac_hash": hashlib.sha256(str(mac).encode()).hexdigest()[:16],
-            "timestamp": ts,
-            "est_x": est_x,
-            "est_y": est_y,
-            "zone_id": zone_id,
-            "area_name": area_name,
-        })
-
-    # Save upload record
-    upload = RssiUpload(
-        id=str(uuid.uuid4()),
-        area_id=area_id,
-        filename=file.filename,
-        record_count=len(df),
-    )
-    db.add(upload)
-    await db.flush()
-
-    # Save device positions
-    for row in located:
-        try:
-            ts = pd.to_datetime(row["timestamp"]).to_pydatetime()
-        except Exception:
-            ts = datetime.utcnow()
-        db.add(DevicePosition(
-            id=str(uuid.uuid4()),
-            upload_id=upload.id,
-            mac_hash=row["mac_hash"],
-            timestamp=ts,
-            est_x=row["est_x"],
-            est_y=row["est_y"],
-            zone_id=row["zone_id"],
-            area_name=row["area_name"],
-        ))
-
-    await db.commit()
-
-    timestamps_unique = sorted(set(str(r["timestamp"]) for r in located))
-    zones_detected = len(set(r["zone_id"] for r in located if r["zone_id"]))
-
-    return {
-        "upload_id": upload.id,
-        "records_processed": len(df),
-        "devices_located": len(located),
-        "timestamps": len(timestamps_unique),
-        "zones_detected": zones_detected,
-        "area_name_matched": area.name,
-    }
-
-
-# ── OCCUPANCY ─────────────────────────────────────────────────────
-@app.get("/api/occupancy")
-async def get_occupancy(
-    area_id: str,
-    timestamp: Optional[str] = None,
-    db: AsyncSession = Depends(get_db),
-):
-    result = await db.execute(select(Area).where(Area.id == area_id))
-    area = result.scalar_one_or_none()
-    if not area:
-        raise HTTPException(404, "Area not found")
-
-    zones_result = await db.execute(select(Zone).where(Zone.area_id == area_id))
-    zones = {z.id: z for z in zones_result.scalars().all()}
-
-    # Get latest upload for this area
-    uploads_result = await db.execute(
-        select(RssiUpload).where(RssiUpload.area_id == area_id).order_by(RssiUpload.uploaded_at.desc())
-    )
-    uploads = uploads_result.scalars().all()
-    if not uploads:
-        return {"zones": [], "total_devices": 0, "most_crowded": None}
-
-    upload_ids = [u.id for u in uploads]
-
-    # Query device positions
-    q = select(DevicePosition).where(DevicePosition.upload_id.in_(upload_ids))
-    if timestamp:
-        try:
-            ts = pd.to_datetime(timestamp)
-            q = q.where(DevicePosition.timestamp == ts)
-        except Exception:
-            pass
-    else:
-        # Get latest timestamp
-        ts_result = await db.execute(
-            select(DevicePosition.timestamp)
-            .where(DevicePosition.upload_id.in_(upload_ids))
-            .order_by(DevicePosition.timestamp.desc())
-            .limit(1)
-        )
-        latest_ts = ts_result.scalar_one_or_none()
-        if latest_ts:
-            q = q.where(DevicePosition.timestamp == latest_ts)
-
-    devs_result = await db.execute(q)
-    devs = devs_result.scalars().all()
-    total = len(devs)
-
-    zone_counts = {}
-    for d in devs:
-        if d.zone_id and d.zone_id in zones:
-            zone_counts[d.zone_id] = zone_counts.get(d.zone_id, 0) + 1
-
-    out_zones = []
-    for zid, z in zones.items():
-        count = zone_counts.get(zid, 0)
-        pct = round(count / max(z.capacity, 1) * 100, 1)
-        out_zones.append({
-            "zone_id": zid,
-            "zone_name": z.name,
-            "devices": count,
-            "capacity": z.capacity,
-            "occupancy_pct": pct,
-            "status": get_zone_status(pct),
-            "color": z.color,
-        })
-
-    out_zones.sort(key=lambda x: -x["occupancy_pct"])
-    most_crowded = out_zones[0]["zone_name"] if out_zones else None
-
-    return {"zones": out_zones, "total_devices": total, "most_crowded": most_crowded}
-
-
-# ── DEVICES ───────────────────────────────────────────────────────
-@app.get("/api/devices")
-async def get_devices(
-    area_id: str,
-    timestamp: Optional[str] = None,
-    db: AsyncSession = Depends(get_db),
-):
-    result = await db.execute(select(Area).where(Area.id == area_id))
-    area = result.scalar_one_or_none()
-    if not area:
-        raise HTTPException(404, "Area not found")
-
-    uploads_result = await db.execute(
-        select(RssiUpload).where(RssiUpload.area_id == area_id).order_by(RssiUpload.uploaded_at.desc())
-    )
-    uploads = uploads_result.scalars().all()
-    if not uploads:
-        return {"devices": []}
-
-    upload_ids = [u.id for u in uploads]
-    zones_result = await db.execute(select(Zone).where(Zone.area_id == area_id))
-    zones = {z.id: z for z in zones_result.scalars().all()}
-
-    q = select(DevicePosition).where(DevicePosition.upload_id.in_(upload_ids))
-    if timestamp:
-        try:
-            ts = pd.to_datetime(timestamp)
-            q = q.where(DevicePosition.timestamp == ts)
-        except Exception:
-            pass
-    else:
-        ts_result = await db.execute(
-            select(DevicePosition.timestamp)
-            .where(DevicePosition.upload_id.in_(upload_ids))
-            .order_by(DevicePosition.timestamp.desc())
-            .limit(1)
-        )
-        latest_ts = ts_result.scalar_one_or_none()
-        if latest_ts:
-            q = q.where(DevicePosition.timestamp == latest_ts)
-
-    devs_result = await db.execute(q)
-    devs = devs_result.scalars().all()
-
-    width_m = area.width_m or 100
-    height_m = area.height_m or 60
-
-    out = []
-    for d in devs:
-        sx, sy = meters_to_svg(d.est_x, d.est_y, width_m, height_m)
-        zone_name = zones[d.zone_id].name if d.zone_id and d.zone_id in zones else None
-        out.append({
-            "mac_hash": d.mac_hash,
-            "est_x": d.est_x,
-            "est_y": d.est_y,
-            "x_svg": sx,
-            "y_svg": sy,
-            "zone_id": d.zone_id,
-            "zone_name": zone_name,
-            "timestamp": str(d.timestamp),
-        })
-
-    return {"devices": out}
-
-
-# ── TIMESTAMPS ────────────────────────────────────────────────────
-@app.get("/api/timestamps")
-async def get_timestamps(area_id: str, db: AsyncSession = Depends(get_db)):
-    uploads_result = await db.execute(
-        select(RssiUpload).where(RssiUpload.area_id == area_id)
-    )
-    upload_ids = [u.id for u in uploads_result.scalars().all()]
-    if not upload_ids:
-        return {"timestamps": []}
-
-    ts_result = await db.execute(
-        select(DevicePosition.timestamp)
-        .where(DevicePosition.upload_id.in_(upload_ids))
-        .distinct()
-        .order_by(DevicePosition.timestamp)
-    )
-    timestamps = [str(r[0]) for r in ts_result.all()]
-    return {"timestamps": timestamps}
-
-
-# ── ANALYTICS ─────────────────────────────────────────────────────
-@app.get("/api/analytics")
-async def get_analytics(area_id: str, db: AsyncSession = Depends(get_db)):
-    uploads_result = await db.execute(
-        select(RssiUpload).where(RssiUpload.area_id == area_id).order_by(RssiUpload.uploaded_at)
-    )
-    uploads = uploads_result.scalars().all()
-    if not uploads:
-        return {
-            "hourly_trend": [], "zone_popularity": [],
-            "peak_hour": None, "total_uploads": 0,
-        }
-
-    upload_ids = [u.id for u in uploads]
-    zones_result = await db.execute(select(Zone).where(Zone.area_id == area_id))
-    zones = {z.id: z for z in zones_result.scalars().all()}
-
-    devs_result = await db.execute(
-        select(DevicePosition).where(DevicePosition.upload_id.in_(upload_ids))
-        .order_by(DevicePosition.timestamp)
-    )
-    devs = devs_result.scalars().all()
-
-    # Hourly trend
-    ts_counts = {}
-    for d in devs:
-        key = str(d.timestamp)
-        ts_counts[key] = ts_counts.get(key, 0) + 1
-
-    hourly_trend = [{"timestamp": k, "total_devices": v} for k, v in sorted(ts_counts.items())]
-
-    # Peak hour
-    peak_hour = max(ts_counts, key=ts_counts.get) if ts_counts else None
-
-    # Zone popularity
-    zone_device_counts = {}
-    zone_ts_counts = {}
-    for d in devs:
-        if d.zone_id and d.zone_id in zones:
-            key = str(d.timestamp)
-            if d.zone_id not in zone_device_counts:
-                zone_device_counts[d.zone_id] = {}
-            zone_device_counts[d.zone_id][key] = zone_device_counts[d.zone_id].get(key, 0) + 1
-
-    zone_popularity = []
-    for zid, z in zones.items():
-        if zid in zone_device_counts:
-            ts_pcts = [
-                min(count / max(z.capacity, 1) * 100, 100)
-                for count in zone_device_counts[zid].values()
-            ]
-            avg_pct = round(sum(ts_pcts) / len(ts_pcts), 1)
-        else:
-            avg_pct = 0.0
-        zone_popularity.append({"zone_name": z.name, "avg_occupancy_pct": avg_pct})
-
-    return {
-        "hourly_trend": hourly_trend,
-        "zone_popularity": zone_popularity,
-        "peak_hour": peak_hour,
-        "total_uploads": len(uploads),
-    }
-
 
 # ── LIVE WI-FI STREAM (Phase 2) ───────────────────────────────────
 # A real Wi-Fi controller (or the simulator) POSTs RSSI batches to
@@ -1192,6 +871,78 @@ def _seconds_ago(dt):
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return max(0, int((datetime.now(timezone.utc) - dt).total_seconds()))
+
+
+HISTORY_RETENTION_DAYS = 90  # rolling ~3 months
+_last_purge_at = None         # module-level throttle for opportunistic cleanup
+
+
+async def _record_history(db, area, zones, located, now):
+    """Upsert this snapshot's per-zone occupancy into the current hour bucket.
+    Lightweight: a handful of indexed upserts per push — does not block live state."""
+    hour_bucket = now.replace(minute=0, second=0, microsecond=0)
+
+    # Count located devices per zone
+    zone_counts = {}
+    for d in located:
+        if d["zone_id"]:
+            zone_counts[d["zone_id"]] = zone_counts.get(d["zone_id"], 0) + 1
+
+    for z in zones:
+        count = zone_counts.get(z.id, 0)
+        cap = max(z.capacity or 1, 1)
+        pct = round(count / cap * 100, 2)
+        status = get_zone_status(pct)
+        q = "quiet_n" if status == "QUIET" else "moderate_n" if status == "MODERATE" \
+            else "busy_n" if status == "BUSY" else "critical_n"
+
+        row = {
+            "id": str(uuid.uuid4()),
+            "area_id": area.id, "area_name": area.name,
+            "zone_id": z.id, "zone_name": z.name, "capacity": z.capacity or 0,
+            "hour_bucket": hour_bucket,
+            "sample_count": 1, "sum_pct": pct, "sum_devices": count,
+            "peak_pct": pct, "peak_devices": count,
+            "quiet_n": 1 if q == "quiet_n" else 0,
+            "moderate_n": 1 if q == "moderate_n" else 0,
+            "busy_n": 1 if q == "busy_n" else 0,
+            "critical_n": 1 if q == "critical_n" else 0,
+        }
+        stmt = pg_insert(ZoneHourlyStat).values(**row)
+        stmt = stmt.on_conflict_do_update(
+            constraint="uq_zone_hour",
+            set_={
+                "sample_count": ZoneHourlyStat.sample_count + 1,
+                "sum_pct": ZoneHourlyStat.sum_pct + pct,
+                "sum_devices": ZoneHourlyStat.sum_devices + count,
+                "peak_pct": func.greatest(ZoneHourlyStat.peak_pct, pct),
+                "peak_devices": func.greatest(ZoneHourlyStat.peak_devices, count),
+                "quiet_n": ZoneHourlyStat.quiet_n + row["quiet_n"],
+                "moderate_n": ZoneHourlyStat.moderate_n + row["moderate_n"],
+                "busy_n": ZoneHourlyStat.busy_n + row["busy_n"],
+                "critical_n": ZoneHourlyStat.critical_n + row["critical_n"],
+                "capacity": z.capacity or 0,
+                "zone_name": z.name,
+                "area_name": area.name,
+                "updated_at": now,
+            },
+        )
+        await db.execute(stmt)
+
+
+async def _purge_old_history(db, force=False):
+    """Delete history older than the retention window. Throttled to once/hour
+    unless forced (e.g. on startup)."""
+    global _last_purge_at
+    now = datetime.now(timezone.utc)
+    if not force and _last_purge_at and (now - _last_purge_at).total_seconds() < 3600:
+        return 0
+    cutoff = now - timedelta(days=HISTORY_RETENTION_DAYS)
+    result = await db.execute(
+        delete(ZoneHourlyStat).where(ZoneHourlyStat.hour_bucket < cutoff)
+    )
+    _last_purge_at = now
+    return result.rowcount or 0
 
 
 @app.post("/api/stream/ingest")
@@ -1270,11 +1021,20 @@ async def stream_ingest(batch: StreamBatch, db: AsyncSession = Depends(get_db)):
                 zone_id=d["zone_id"], area_name=area_name,
             ))
 
+        # Log this snapshot into rolling hourly history
+        await _record_history(db, area, zones, located, now)
+
         results.append({
             "area_name": area_name,
             "devices_located": len(located),
             "readings": len(readings),
         })
+
+    # Opportunistic retention cleanup (throttled to once/hour, non-blocking-ish)
+    try:
+        await _purge_old_history(db)
+    except Exception:
+        pass
 
     await db.commit()
 
@@ -1388,22 +1148,277 @@ async def stream_status(db: AsyncSession = Depends(get_db)):
     return {"server_time": datetime.now(timezone.utc).isoformat(), "areas": out}
 
 
-# ── LEGACY ENDPOINTS (backwards compat) ───────────────────────────
-@app.post("/upload")
-async def legacy_upload(file: UploadFile = File(...)):
-    return {"error": "Use /api/upload with area_id"}
+# ── HISTORICAL ANALYTICS (Phase 2.1) ──────────────────────────────
+# All numbers below are derived from the rolling zone_hourly_stats table.
+
+DOW_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
 
-@app.get("/occupancy")
-async def legacy_occupancy():
-    return {"error": "Use /api/occupancy?area_id=xxx"}
+def _parse_dt(s):
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
 
 
-@app.get("/devices")
-async def legacy_devices():
-    return {"error": "Use /api/devices?area_id=xxx"}
+@app.get("/api/analytics/meta")
+async def analytics_meta(db: AsyncSession = Depends(get_db)):
+    """Filter options (full Building → Floor → Area → Zone hierarchy) + the
+    date range for which history exists."""
+    cov = await db.execute(
+        select(func.min(ZoneHourlyStat.hour_bucket), func.max(ZoneHourlyStat.hour_bucket),
+               func.count(ZoneHourlyStat.id))
+    )
+    earliest, latest, total = cov.first()
+
+    buildings_res = await db.execute(select(Building).order_by(Building.created_at))
+    buildings = []
+    for b in buildings_res.scalars().all():
+        floors_res = await db.execute(
+            select(Floor).where(Floor.building_id == b.id).order_by(Floor.level_number)
+        )
+        floors = []
+        for f in floors_res.scalars().all():
+            areas_res = await db.execute(
+                select(Area).where(Area.floor_id == f.id).order_by(Area.created_at)
+            )
+            areas = []
+            for a in areas_res.scalars().all():
+                zres = await db.execute(
+                    select(Zone).where(Zone.area_id == a.id).order_by(Zone.created_at)
+                )
+                areas.append({
+                    "area_id": a.id, "area_name": a.name,
+                    "zones": [{"zone_id": z.id, "zone_name": z.name, "capacity": z.capacity}
+                              for z in zres.scalars().all()],
+                })
+            floors.append({"floor_id": f.id, "floor_name": f.name,
+                           "level_number": f.level_number, "areas": areas})
+        buildings.append({"building_id": b.id, "building_name": b.name, "floors": floors})
+
+    return {
+        "coverage": {
+            "earliest": str(earliest) if earliest else None,
+            "latest": str(latest) if latest else None,
+            "total_rows": total or 0,
+        },
+        "buildings": buildings,
+        "retention_days": HISTORY_RETENTION_DAYS,
+    }
 
 
-@app.get("/timestamps")
-async def legacy_timestamps():
-    return {"error": "Use /api/timestamps?area_id=xxx"}
+async def _window_avg(db, base_filters, start, end):
+    """Sample-weighted average occupancy % over a time window (or None)."""
+    q = select(func.sum(ZoneHourlyStat.sum_pct), func.sum(ZoneHourlyStat.sample_count)).where(
+        *base_filters,
+        ZoneHourlyStat.hour_bucket >= start,
+        ZoneHourlyStat.hour_bucket < end,
+    )
+    r = (await db.execute(q)).first()
+    sum_pct, n = (r[0] or 0), (r[1] or 0)
+    if not n:
+        return None
+    return round(sum_pct / n, 1)
+
+
+@app.get("/api/analytics/summary")
+async def analytics_summary(
+    area_ids: Optional[str] = None,   # comma-separated; omit = all areas
+    zone_id: Optional[str] = None,
+    start: Optional[str] = None,      # ISO datetime (UTC)
+    end: Optional[str] = None,
+    dow: Optional[int] = None,        # 0=Mon … 6=Sun (local), filter
+    hour_start: Optional[int] = None, # local hour 0-23 inclusive
+    hour_end: Optional[int] = None,   # local hour 0-23 inclusive
+    tz_offset: int = 0,               # minutes, from JS getTimezoneOffset()
+    group_by: str = "zone",           # ranking level: zone | area | floor
+    db: AsyncSession = Depends(get_db),
+):
+    now = datetime.now(timezone.utc)
+    start_dt = _parse_dt(start) or (now - timedelta(days=7))
+    end_dt = _parse_dt(end) or now
+
+    base_filters = []
+    area_id_list = [a for a in (area_ids.split(",") if area_ids else []) if a]
+    if area_id_list:
+        base_filters.append(ZoneHourlyStat.area_id.in_(area_id_list))
+    if zone_id:
+        base_filters.append(ZoneHourlyStat.zone_id == zone_id)
+
+    # Fetch the rows in range matching the area/zone filters
+    rows = (await db.execute(
+        select(ZoneHourlyStat).where(
+            *base_filters,
+            ZoneHourlyStat.hour_bucket >= start_dt,
+            ZoneHourlyStat.hour_bucket <= end_dt,
+        )
+    )).scalars().all()
+
+    def local(dt):
+        return dt - timedelta(minutes=tz_offset)
+
+    # Apply local-time filters (day-of-week, hour-of-day)
+    matched = []
+    for r in rows:
+        ldt = local(r.hour_bucket)
+        if dow is not None and ldt.weekday() != dow:
+            continue
+        if hour_start is not None and hour_end is not None:
+            h = ldt.hour
+            ok = (hour_start <= h <= hour_end) if hour_start <= hour_end else (h >= hour_start or h <= hour_end)
+            if not ok:
+                continue
+        matched.append((r, ldt))
+
+    if not matched:
+        return {
+            "has_data": False,
+            "period": {"start": str(start_dt), "end": str(end_dt)},
+            "message": "No data available yet for this selection. Data is still accumulating.",
+        }
+
+    # Helper to sample-weighted-average a list of (sum_pct, n)
+    def wavg(pairs):
+        s = sum(p for p, _ in pairs)
+        n = sum(c for _, c in pairs)
+        return round(s / n, 1) if n else 0.0
+
+    total_n = sum(r.sample_count for r, _ in matched)
+    total_sum_pct = sum(r.sum_pct for r, _ in matched)
+    overall_avg = round(total_sum_pct / total_n, 1) if total_n else 0.0
+    overall_peak = round(max((r.peak_pct for r, _ in matched), default=0.0), 1)
+
+    span_days = (end_dt - start_dt).total_seconds() / 86400
+    granularity = "hour" if span_days <= 2 else "day"
+
+    # ── Trend over time ──
+    trend_acc = {}
+    for r, ldt in matched:
+        key = ldt.strftime("%Y-%m-%d %H:00") if granularity == "hour" else ldt.strftime("%Y-%m-%d")
+        a = trend_acc.setdefault(key, {"sum_pct": 0.0, "n": 0, "peak": 0.0})
+        a["sum_pct"] += r.sum_pct
+        a["n"] += r.sample_count
+        a["peak"] = max(a["peak"], r.peak_pct)
+    trend = [{"bucket": k, "avg_pct": round(v["sum_pct"] / v["n"], 1) if v["n"] else 0,
+              "peak_pct": round(v["peak"], 1)} for k, v in sorted(trend_acc.items())]
+
+    # ── Peak hours (avg by local hour-of-day) ──
+    hour_acc = {}
+    for r, ldt in matched:
+        a = hour_acc.setdefault(ldt.hour, [0.0, 0])
+        a[0] += r.sum_pct; a[1] += r.sample_count
+    peak_hours = [{"hour": h, "avg_pct": round(v[0] / v[1], 1) if v[1] else 0}
+                  for h, v in sorted(hour_acc.items())]
+
+    # ── Peak days (avg by local day-of-week) ──
+    dow_acc = {}
+    for r, ldt in matched:
+        a = dow_acc.setdefault(ldt.weekday(), [0.0, 0])
+        a[0] += r.sum_pct; a[1] += r.sample_count
+    peak_days = [{"dow": d, "day": DOW_NAMES[d], "avg_pct": round(v[0] / v[1], 1) if v[1] else 0}
+                 for d, v in sorted(dow_acc.items())]
+
+    # ── Ranking (level depends on group_by: zone | area | floor) ──
+    level = group_by if group_by in ("zone", "area", "floor") else "zone"
+
+    # Build a mapping to floor names when ranking by floor
+    area_to_floor = {}
+    floor_names = {}
+    if level == "floor":
+        matched_area_ids = list({r.area_id for r, _ in matched})
+        if matched_area_ids:
+            ares = (await db.execute(select(Area).where(Area.id.in_(matched_area_ids)))).scalars().all()
+            for a in ares:
+                area_to_floor[a.id] = a.floor_id
+            fids = list({fid for fid in area_to_floor.values() if fid})
+            if fids:
+                frs = (await db.execute(select(Floor).where(Floor.id.in_(fids)))).scalars().all()
+                for f in frs:
+                    floor_names[f.id] = f.name
+
+    def group_key_name(r):
+        if level == "zone":
+            return r.zone_id, r.zone_name
+        if level == "area":
+            return r.area_id, r.area_name
+        fid = area_to_floor.get(r.area_id)
+        return fid, floor_names.get(fid, "Unknown floor")
+
+    rank_acc = {}
+    for r, _ in matched:
+        k, name = group_key_name(r)
+        if k is None:
+            continue
+        a = rank_acc.setdefault(k, {"name": name, "sum_pct": 0.0, "n": 0, "peak": 0.0})
+        a["sum_pct"] += r.sum_pct; a["n"] += r.sample_count; a["peak"] = max(a["peak"], r.peak_pct)
+    ranking_items = sorted(
+        [{"id": k, "name": v["name"],
+          "avg_pct": round(v["sum_pct"] / v["n"], 1) if v["n"] else 0,
+          "peak_pct": round(v["peak"], 1)} for k, v in rank_acc.items()],
+        key=lambda x: -x["avg_pct"],
+    )
+    ranking = {"level": level, "items": ranking_items}
+
+    # ── Heatmap (avg by dow × hour) ──
+    heat_acc = {}
+    for r, ldt in matched:
+        key = (ldt.weekday(), ldt.hour)
+        a = heat_acc.setdefault(key, [0.0, 0])
+        a[0] += r.sum_pct; a[1] += r.sample_count
+    heatmap = [{"dow": d, "hour": h, "avg_pct": round(v[0] / v[1], 1) if v[1] else 0}
+               for (d, h), v in heat_acc.items()]
+
+    # ── Utilization (% of time in each status) ──
+    util = {"quiet": 0, "moderate": 0, "busy": 0, "critical": 0}
+    for r, _ in matched:
+        util["quiet"] += r.quiet_n; util["moderate"] += r.moderate_n
+        util["busy"] += r.busy_n; util["critical"] += r.critical_n
+    util_total = sum(util.values()) or 1
+    utilization = {k: round(v / util_total * 100, 1) for k, v in util.items()}
+
+    # ── Avg vs peak per area ──
+    area_acc = {}
+    for r, _ in matched:
+        a = area_acc.setdefault(r.area_id, {"name": r.area_name, "sum_pct": 0.0, "n": 0, "peak": 0.0})
+        a["sum_pct"] += r.sum_pct; a["n"] += r.sample_count; a["peak"] = max(a["peak"], r.peak_pct)
+    area_avg_peak = [{"area_id": k, "area_name": v["name"],
+                      "avg_pct": round(v["sum_pct"] / v["n"], 1) if v["n"] else 0,
+                      "peak_pct": round(v["peak"], 1)} for k, v in area_acc.items()]
+
+    # ── Trend comparisons (rolling windows, real % change) ──
+    def pct_change(cur, prev):
+        if cur is None or prev is None or prev == 0:
+            return None
+        return round((cur - prev) / prev * 100, 1)
+
+    wk_cur = await _window_avg(db, base_filters, now - timedelta(days=7), now)
+    wk_prev = await _window_avg(db, base_filters, now - timedelta(days=14), now - timedelta(days=7))
+    mo_cur = await _window_avg(db, base_filters, now - timedelta(days=30), now)
+    mo_prev = await _window_avg(db, base_filters, now - timedelta(days=60), now - timedelta(days=30))
+
+    return {
+        "has_data": True,
+        "period": {"start": str(start_dt), "end": str(end_dt), "granularity": granularity},
+        "totals": {
+            "avg_pct": overall_avg, "peak_pct": overall_peak,
+            "samples": total_n,
+            "first_sample": str(min(r.hour_bucket for r, _ in matched)),
+            "last_sample": str(max(r.hour_bucket for r, _ in matched)),
+        },
+        "trend": trend,
+        "peak_hours": peak_hours,
+        "peak_days": peak_days,
+        "ranking": ranking,
+        "heatmap": heatmap,
+        "utilization": utilization,
+        "area_avg_peak": area_avg_peak,
+        "comparisons": {
+            "week": {"current": wk_cur, "previous": wk_prev, "pct_change": pct_change(wk_cur, wk_prev)},
+            "month": {"current": mo_cur, "previous": mo_prev, "pct_change": pct_change(mo_cur, mo_prev)},
+        },
+    }

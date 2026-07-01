@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime
-from sqlalchemy import Column, String, Text, Float, Integer, Boolean, ForeignKey, DateTime
+from sqlalchemy import Column, String, Text, Float, Integer, Boolean, ForeignKey, DateTime, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
@@ -108,3 +108,30 @@ class DevicePosition(Base):
     area_name = Column(Text)
     upload = relationship("RssiUpload", back_populates="device_positions")
     zone = relationship("Zone", back_populates="device_positions")
+
+
+class ZoneHourlyStat(Base):
+    """Rolling historical analytics — one aggregated row per zone per hour.
+    Each live ingest upserts into the current hour's bucket (running totals)."""
+    __tablename__ = "zone_hourly_stats"
+    id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    area_id = Column(UUID(as_uuid=False), index=True)
+    area_name = Column(Text)
+    zone_id = Column(UUID(as_uuid=False), index=True)
+    zone_name = Column(Text)
+    capacity = Column(Integer, default=10)
+    hour_bucket = Column(DateTime(timezone=True), nullable=False, index=True)  # UTC, truncated to hour
+    sample_count = Column(Integer, default=0)
+    sum_pct = Column(Float, default=0.0)       # Σ occupancy_pct → avg = sum_pct / sample_count
+    sum_devices = Column(Float, default=0.0)   # Σ device_count → avg devices
+    peak_pct = Column(Float, default=0.0)
+    peak_devices = Column(Integer, default=0)
+    quiet_n = Column(Integer, default=0)       # samples in each status → utilization %
+    moderate_n = Column(Integer, default=0)
+    busy_n = Column(Integer, default=0)
+    critical_n = Column(Integer, default=0)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("zone_id", "hour_bucket", name="uq_zone_hour"),
+    )

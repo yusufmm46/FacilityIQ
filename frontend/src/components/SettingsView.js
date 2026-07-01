@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Sliders, Bell, BrainCircuit, RefreshCw, BadgeCheck } from 'lucide-react';
+import { Sliders, Bell, RefreshCw, BadgeCheck } from 'lucide-react';
 
 function Toggle({ checked, onChange }) {
   return (
@@ -19,12 +19,6 @@ function Toggle({ checked, onChange }) {
   );
 }
 
-const INTELLIGENCE_PRESETS = [
-  { name: 'Maximum Sensitivity', desc: 'Accelerates alert dispatches; highly precise micro-counts.' },
-  { name: 'Balanced Intelligence', desc: 'Smooths sensor packet noise; standard enterprise calibration.' },
-  { name: 'Conservative Auditing', desc: 'Triggers alerts only upon sustained congestion thresholds.' },
-];
-
 export default function SettingsView({
   alertThreshold, setAlertThreshold,
   alertsEnabled, setAlertsEnabled,
@@ -33,13 +27,21 @@ export default function SettingsView({
   operatingHoursStart, setOperatingHoursStart,
   operatingHoursEnd, setOperatingHoursEnd,
   maxLoadCapacity, setMaxLoadCapacity,
-  intelligenceMode, setIntelligenceMode,
-  dataRetention, setDataRetention,
+  userEmail,
   onSave,
 }) {
-  const [profileName, setProfileName] = useState('Alex Rivera');
-  const [profileEmail, setProfileEmail] = useState('alex.rivera@facilityiq.com');
-  const [profileTitle, setProfileTitle] = useState('OPERATIONS HEAD');
+  const derivedName = (() => {
+    if (!userEmail) return 'User';
+    const local = userEmail.split('@')[0];
+    return local.split(/[._-]+/).filter(Boolean)
+      .map(p => p.replace(/\d+/g, '')).filter(Boolean)
+      .map(p => p.charAt(0).toUpperCase() + p.slice(1)).join(' ') || local;
+  })();
+  const derivedInitials = (derivedName.split(' ').map(p => p[0]).join('').slice(0, 2) || 'U').toUpperCase();
+
+  const [profileName, setProfileName] = useState(derivedName);
+  const [profileEmail, setProfileEmail] = useState(userEmail || '');
+  const [profileTitle, setProfileTitle] = useState('Operations');
   const [isSaved, setIsSaved] = useState(false);
 
   const handleSaveAll = (e) => {
@@ -54,9 +56,9 @@ export default function SettingsView({
 
       {/* Intro */}
       <section className="bg-white rounded-2xl p-6 border border-slate-100 space-y-1">
-        <h2 className="font-display text-2xl font-bold text-primary">System Control Center</h2>
+        <h2 className="font-display text-2xl font-bold text-primary">Settings</h2>
         <p className="font-sans text-xs text-on-surface-variant font-medium">
-          Configure deep neural calibrations, safety boundaries, and profile states globally.
+          Manage your profile, alert thresholds, operating hours, and notifications.
         </p>
       </section>
 
@@ -69,11 +71,11 @@ export default function SettingsView({
           <div className="glass-card rounded-2xl p-6 bg-white border border-slate-100/80 space-y-5">
             <div className="flex items-center gap-4">
               <div className="w-16 h-16 rounded-2xl border-2 border-secondary/20 bg-gradient-to-br from-secondary/20 to-primary/20 flex items-center justify-center shadow-md">
-                <span className="text-2xl font-bold text-secondary">AR</span>
+                <span className="text-2xl font-bold text-secondary">{derivedInitials}</span>
               </div>
               <div>
-                <h3 className="font-display text-lg font-bold text-primary">Alex Rivera</h3>
-                <p className="font-mono text-[9px] font-bold text-secondary uppercase tracking-widest mt-1">OPERATIONS HEAD</p>
+                <h3 className="font-display text-lg font-bold text-primary">{profileName}</h3>
+                <p className="font-mono text-[9px] font-bold text-secondary uppercase tracking-widest mt-1">{profileEmail || 'Signed in'}</p>
               </div>
             </div>
 
@@ -170,35 +172,6 @@ export default function SettingsView({
         {/* Right column */}
         <div className="md:col-span-5 space-y-6">
 
-          {/* Intelligence modes */}
-          <div className="glass-card rounded-2xl p-6 bg-white border border-slate-100/80 space-y-5">
-            <div className="flex items-center gap-2.5">
-              <BrainCircuit className="text-secondary w-5 h-5" />
-              <h3 className="font-display text-base font-bold text-primary">Intelligence Modes</h3>
-            </div>
-            <div className="space-y-3">
-              {INTELLIGENCE_PRESETS.map(preset => {
-                const isActive = intelligenceMode === preset.name;
-                return (
-                  <div
-                    key={preset.name}
-                    onClick={() => setIntelligenceMode(preset.name)}
-                    className={`p-3.5 rounded-xl border-2 cursor-pointer transition-all ${
-                      isActive
-                        ? 'bg-teal-50/40 border-secondary'
-                        : 'bg-white hover:bg-slate-50 border-slate-100 hover:border-slate-200'
-                    }`}
-                  >
-                    <p className={`font-sans font-bold text-xs ${isActive ? 'text-secondary' : 'text-primary'}`}>
-                      {preset.name}
-                    </p>
-                    <p className="text-[11px] text-on-surface-variant mt-1 leading-normal">{preset.desc}</p>
-                  </div>
-                );
-              })}
-            </div>
-          </div>
-
           {/* Notifications */}
           <div className="glass-card rounded-2xl p-6 bg-white border border-slate-100/80 space-y-5">
             <div className="flex items-center gap-2.5">
@@ -235,19 +208,6 @@ export default function SettingsView({
                   <Toggle checked={toggle.val} onChange={toggle.set} />
                 </div>
               ))}
-
-              <div className="flex flex-col space-y-1.5 border-t border-slate-50 pt-4">
-                <label className="font-mono text-[9px] uppercase font-bold text-slate-400">Data Retention Strategy</label>
-                <select
-                  value={dataRetention}
-                  onChange={e => setDataRetention(e.target.value)}
-                  className="bg-slate-50 border border-slate-200 rounded-xl text-xs font-semibold py-2 px-3 outline-none cursor-pointer"
-                >
-                  <option value="90 Days (Enterprise)">90 Days (Enterprise Retention)</option>
-                  <option value="30 Days (Standard)">30 Days (Standard Retention)</option>
-                  <option value="365 Days (Longterm)">365 Days (Longterm Archive)</option>
-                </select>
-              </div>
             </div>
           </div>
 
